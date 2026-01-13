@@ -1,0 +1,1516 @@
+---
+title: "Refractory Septic Shock Incidence and Outcomes"
+author: "Seth Bauer"
+date: last-modified
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: zephyr
+---
+
+# Overview
+
+Refractory septic shock was recently defined and clinical criteria established per a Delphi consensus process (Leone, [under peer review]). However, the incidence of refractory septic shock per clinical criteria and comparative outcomes between patients meeting and not meeting criteria are unknown. This retrospective cohort study was designed with two co-primary goals; 1a) to describe the cumulative incidence of refractory septic shock per clinical criteria, and 1b) to compare characteristics and outcomes of patients with septic shock who met and did not meet clinical criteria for refractory septic shock.
+
+# Load Packages and Setup
+
+```{r load_setup}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA)
+options(width = 70)
+
+library(broom.mixed); library(conflicted); library(Epi); library(flextable);   
+library(gtsummary); library(ivs); library(janitor); library(kableExtra); 
+library(lme4); library(MKinfer); #For `boot.t.test` function
+library(naniar); library(patchwork); library(report); library(renv); 
+library(vroom); library(tidyverse)
+
+theme_set(theme_bw())
+
+conflict_prefer("count", "dplyr"); conflict_prefer("select", "dplyr"); 
+conflict_prefer("filter", "dplyr"); conflict_prefer("recode", "dplyr");
+conflict_prefer("min", "base"); conflict_prefer("max", "base");
+conflict_prefer("var", "stats"); conflict_prefer("data.frame", "base");
+conflict_prefer("sum", "base"); conflict_prefer("mean", "base")
+```
+
+# Load Data
+
+Read in the data from .Rds files created in previous work. Each source .Rds file utilized multiple input files or queries, which will not be iterated here. See [Bauer 2025](https://link.springer.com/article/10.1186/s13054-025-05749-1) and the [open source Quarto Documents](https://github.com/ClevelandClinicQHS/sepsis-case-identification-workflow) for the process steps to build the patient cohorts and .Rds files. Also load a file containing a lookup table of emergency department and hospital characteristics. The data sources for this document are:
+
+| Tibble | File (.Rds) | Source Quarto Document (.qmd) |
+|-------------------|--------------------------|---------------------------|
+| shock | shock | sepsis_combined |
+| pressors_courses | vasopressors_courses | vasopressors |
+| pressors_doses | vasopressors_long | vasopressors |
+| hosp_char | Hospital_characteristics.csv | none (raw file) |
+| body_weight | weight | weight |
+| comor | comorbidities | comorbidities |
+| lactate | lactate_all | lactate |
+| steroids | steroids | steroids |
+
+Some .Rds files include all observations in the raw queries, but in this work only observations from patients meeting clinical criteria for septic shock are of interest. Therefore, as applicable, the call below filters observations to those from septic shock cases. This call also selects vectors (columns) of interest for this work, clarifies the name of one hospital location, adjusts vector structure as needed, and drops unused levels of factor variables.
+
+```{r}
+shock_orig <- read_rds(
+  "/proj/DaltonLab/projects/sbauer/rds_files/shock.Rds"
+  ) |>
+  filter(shock_ase == "ASE" | shock_sepsis3 == "Sep3") |>
+  select(-contains("icd")) |>
+  rename(criteria_met = shock_combined) |>
+  mutate(shock_ase_onset_hospital = 
+           if_else(shock_ase_onset_hospital == "Martin Health St. Lucie West",
+                   "Martin Health South", shock_ase_onset_hospital
+                   ),
+         shock_sep3_onset_hospital = 
+           if_else(shock_sep3_onset_hospital == "Martin Health St. Lucie West",
+                   "Martin Health South", shock_sep3_onset_hospital
+                   ),
+         across(where(is.factor), droplevels)
+         )
+
+pressors_courses <- read_rds(
+  "/proj/DaltonLab/projects/sbauer/rds_files/vasopressors_courses.Rds"
+  ) |>
+  filter(encounter_id %in% shock_orig$encounter_id) |>
+  select(encounter_id, medication, start_time, stop_time) |>
+  mutate(medication = fct_relevel(factor(medication), "norepinephrine",
+                                  "dopamine","phenylephrine", "epinephrine",
+                                  "vasopressin"
+                                  )
+         ) |>
+  arrange(encounter_id, medication, start_time)
+
+pressors_doses <- read_rds(
+  "/proj/DaltonLab/projects/sbauer/rds_files/vasopressors_long.Rds"
+  ) |>
+  filter(encounter_id %in% shock_orig$encounter_id) |>
+  select(-c(dose_mcg_min, dose_mcg_kg_min, dose_units_min))
+
+hosp_char <- 
+  vroom("/proj/DaltonLab/projects/sbauer/data_raw/full_cohort/Hospital_characteristics.csv",
+        col_types = c(hospital = "f", hosp_beds = "f", hosp_beds_cat = "f",
+                      hosp_teaching_status = "f", hosp_state = "f"))
+
+body_weight <- 
+  read_rds("/proj/DaltonLab/projects/sbauer/rds_files/weight.Rds") |>
+  filter(encounter_id %in% shock_orig$encounter_id)
+
+comor <- 
+  read_rds("/proj/DaltonLab/projects/sbauer/rds_files/comorbidities.Rds") |>
+  filter(encounter_id %in% shock_orig$encounter_id)
+
+lactate <- read_rds(
+  "/proj/DaltonLab/projects/sbauer/rds_files/lactate_all.Rds") |>
+  filter(encounter_id %in% shock_orig$encounter_id) |>
+  select(encounter_id, lactate_time = lactate_taken_time,
+         lactate = lactate_result, lactate_type)
+
+steroids <- read_rds(
+  "/proj/DaltonLab/projects/sbauer/rds_files/steroids.Rds") |>
+  filter(encounter_id %in% shock_orig$encounter_id)
+```
+
+Next, confirm that the `encounter_id`s are the same between `shock_orig` and `pressors_courses` as well as between `shock_orig` and `pressors_doses`.
+
+```{r}
+setequal(shock_orig$encounter_id, pressors_courses$encounter_id)
+setequal(shock_orig$encounter_id, pressors_doses$encounter_id)
+```
+
+# Data Transformation
+
+Next, select vectors already in the tibble that will be used for analysis. Then identify and create vectors for characteristics and outcomes that will be used for analysis.
+
+## Select Variables
+
+With the call below, select variables (vectors) of interest in the `shock` tibble that will be used for joining data between tibbles or for analysis. To align with this goal, some vectors need to be created based on the sepsis or septic shock onset time, which may differ between the CDC ASE and Sepsis-3 criteria. Because the onset time for the CDC ASE criteria is transparently outlined (whereas it is unclear for Sepsis-3 clinical criteria), when an observation met CDC ASE criteria (including the cohorts meeting both CDC ASE and Sepsis-3 criteria as well as the cohort meeting CDC ASE criteria only), the values aligning with the sepsis onset time for CDC ASE will be used. If CDC ASE criteria were not met then values aligning with the Sepsis-3 onset time will be used. This approach is aligned with the description in the cohort development manuscript ([Bauer 2025](https://link.springer.com/article/10.1186/s13054-025-05749-1)). To simplify the call, if the case only met Sepsis-3 criteria, the values corresponding to Sepsis-3 will be used. In the remaining cases (when only CDC ASE criteria were met or both criteria were met), the CDC ASE criteria will be used. Vectors containing the term "either" (meaning either CDC ASE or Sepsis-3 criteria were met for the encounter) already use the CDC ASE onset time, as applicable, therefore these vectors will be selected. Some observation concepts did not have a vector with the term "either" created in the cohort development process, therefore these vectors will be created in the call using the same logic. Additionally, rename some vectors for simplicity and clarity, including removal of the prefix "either_".
+
+```{r}
+shock <- shock_orig |>
+  mutate(sepsis_window_start = if_else(criteria_met == "Sep3 only",
+                                       sep3_window_start,
+                                       ase_window_start
+                                       ),
+         sepsis_window_end = if_else(criteria_met == "Sep3 only",
+                                     sep3_window_end,
+                                     ase_window_end
+                                     ),
+         sepsis_onset_hospital = if_else(criteria_met == "Sep3 only",
+                                         sep3_dx_hospital,
+                                         ase_dx_hospital),
+         sepsis_onset_icu_group = if_else(criteria_met == "Sep3 only",
+                                          sep3_onset_icu_group,
+                                          ase_onset_icu_group
+                                          ),
+         sepsis_onset_covid = if_else(criteria_met == "Sep3 only",
+                                      sep3_onset_covid,
+                                      ase_onset_covid),
+         shock_onset_time = if_else(criteria_met == "Sep3 only",
+                                    shock_sep3_onset_time,
+                                    shock_ase_onset_time),
+         shock_onset_unit_type = if_else(criteria_met == "Sep3 only",
+                                         shock_sep3_onset_unit_type,
+                                         shock_ase_onset_unit_type),
+         shock_onset_hospital = if_else(criteria_met == "Sep3 only",
+                                        shock_sep3_onset_hospital,
+                                        shock_ase_onset_hospital
+                                        ),
+          shock_onset_icu_group = 
+           if_else(criteria_met == "Sep3 only",
+                   shock_sep3_onset_icu_group,
+                   shock_ase_onset_icu_group
+                   )
+         ) |>
+  rename(admission_time = key_admission_time,
+         sepsis_onset_tot_sofa = either_tot_sofa,
+         sepsis_onset_unit_type = either_onset_unit_type,
+         encounter_max_sofa = max_sofa
+         ) |>
+  select(-contains(c("ase", "sep3", "sepsis3", "combined")),
+         -c(patient_id, encounter_id_orig, key_discharge_time, first_sepsis,  
+            race, ethnicity, admit_year_cat, sepsis_either, sepsis_any,   
+            shock_either, shock_exclusive, sepsis_clin_v_code,   
+            shock_clin_v_code, either_dx_hosp_beds_cat, either_dx_hosp_state, 
+            either_dx_hosp_teaching_status, covid_positive_through_dc,    
+            either_shock_map_min, either_shock_pressor,      
+            either_shock_lactate_max, either_prior_surg_service, 
+            surgery_30d_prior_to_dc, surg_service_30d_prior_to_dc, dc_hospital,
+            dc_hosp_state, dc_hosp_beds_cat, dc_hosp_teaching_status, 
+            any_icu_admit, bcx_collected, either_abx_days
+            )
+         ) |>
+  rename_with(~ str_replace_all(.x, c("^either_" = "", 
+                                      "^dx_" = "sepsis_onset_"
+                                      )
+                                )
+              )
+```
+
+Now check the vector names in the `shock` tibble to confirm the vectors of interest are included.
+
+```{r}
+names(shock)
+```
+
+The retained vectors are consistent with expectations.
+
+## Create Variables
+
+This sub-section will create and join the cohort identifier (refractory septic shock) as well as patient and hospital characteristics of interest that are not yet included in the `shock` tibble.
+
+### Biological Variables
+
+Many of the covariates (predictors) of interest are in the `shock` tibble already, but some additional covariates of interest need to be joined from other loaded tibbles.
+
+#### Body Weight
+
+Join body weight at shock onset. The first preference for weight is the closest value prior to shock onset. If a weight value prior to shock onset is not available, then use weight taken within 24 hours after shock onset.
+
+```{r}
+shock <- left_join(
+  shock |> mutate(shock_onset_time_plus_24h = shock_onset_time + dhours(24)),
+  body_weight |> select(encounter_id, wt_time, wt_kg) |> distinct(),
+  by = join_by(encounter_id,
+               closest(shock_onset_time >= wt_time)
+               ),
+  relationship = "one-to-one"
+  ) |>
+  left_join(
+    body_weight |> select(encounter_id, wt_time_wi24h = wt_time, 
+                     wt_kg_wi24h = wt_kg) |> distinct(),
+    by = join_by(encounter_id,
+                 shock_onset_time_plus_24h > wt_time_wi24h
+                 ),
+    relationship = "one-to-many"
+  ) |>
+  arrange(encounter_id, shock_onset_time, shock_onset_time_plus_24h) |>
+  distinct(encounter_id, .keep_all = TRUE) |>
+  mutate(wt_kg = coalesce(wt_kg, wt_kg_wi24h),
+         wt_time = coalesce(wt_time, wt_time_wi24h)
+         ) |> 
+  select(-c(shock_onset_time, shock_onset_time_plus_24h, wt_time, 
+            wt_time_wi24h, wt_kg_wi24h
+            ))
+```
+
+Lastly, remove the `body_weight` tibble since it won't be used moving forward.
+
+```{r}
+rm(body_weight)
+```
+
+#### Comorbidities
+
+Join comorbidity data from the `comor` tibble. In this process consolidate some vectors representing illness severity into one vector, indicating presence or absence of the comorbidity (without regard to severity). 
+
+```{r}
+shock <- left_join(
+  shock,
+  comor |>
+    mutate(hypertension =
+             if_else(hypertension_uncomplicated == "Yes" | 
+                       hypertension_complicated == "Yes",
+                     "Yes", "No"
+                     ),
+           liver_disease =
+             if_else(liver_disease_mild == "Yes" | 
+                       liver_disease_and_failure == "Yes",
+                     "Yes", "No"
+                     ),
+           kidney_disease =
+             if_else(renal_kidney_failure_and_disease_moderate == "Yes" |
+                       renal_kidney_failure_and_disease_severe == "Yes",
+                     "Yes", "No"
+                     ),
+           malignancy =
+             if_else(leukemia == "Yes" | lymphoma == "Yes" | 
+                       metastatic_cancer == "Yes" |
+                       solid_tumor_without_metastasis == "Yes", 
+                     "Yes", "No"
+                     ),
+           diabetes =
+             if_else(diabetes_without_chronic_complications == "Yes" |
+                       diabetes_with_chronic_complications == "Yes",
+                     "Yes", "No"
+                     ),
+           ) |>
+              select(encounter_id, cerebrovascular_disease, hypertension,
+                     heart_failure, valvular_disease, 
+                     chronic_pulmonary_disease, pulmonary_circulation_disease,
+                     liver_disease, kidney_disease, malignancy, diabetes, 
+                     obesity, alcohol_abuse, elixhauser_index
+                     ),
+  by = join_by(encounter_id),
+  relationship = "one-to-one"
+  )
+```
+
+Some patients (`encounter_id`s) were not present in the `comor` tibble because they did not have a chronic comorbidity as assessed with the Elixhauser Comorbidity Index. In these cases the comorbidity vectors will have values of "NA". Replace these "NA" values with "No" for the comorbidity vectors and zero for the `elixhauser_index` vector in the call below. 
+
+```{r}
+shock <- shock |>
+  mutate(
+    across(
+      c(cerebrovascular_disease, hypertension,
+        heart_failure, valvular_disease, alcohol_abuse,
+        chronic_pulmonary_disease, pulmonary_circulation_disease,
+        liver_disease, kidney_disease, malignancy, diabetes, obesity
+        ),
+      ~ fct_na_value_to_level(.x, "No")
+    ),
+    elixhauser_index = replace_na(elixhauser_index, 0)
+  )
+```
+
+Lastly, remove the `comor` tibble since it won't be used moving forward.
+
+```{r}
+rm(comor)
+```
+
+### Context Characteristics
+
+#### Shock Onset Treatment Unit
+
+The `shock` tibble has a vector (`shock_onset_unit_type`) for the initial shock treatment location with levels "ED", "Ward", and "ICU", but this is too broad for the purposes of this study. Contrastingly, the `shock_onset_icu_group` vector for ICU designations is too granular for external applicability. Therefore a new vector (`shock_onset_tx_unit`) will be created that combines information from these vectors to generate categories. As noted in the cohort identification work, there are observations with missing values for `shock_onset_unit_type` where the onset time was between the admission and discharge time for emergency department or hospital admissions linked through the `encounter_id`. For these cases with missing values the `sepsis_onset_unit_type` vector will be used when available; if values for both `shock_onset_unit_type` and `sepsis_onset_unit_type` are missing then the value will be regarded as missing (NA). Lastly, remove the `*_unit_type` and `*_icu_group` vectors because they won't be used moving forward.
+
+```{r}
+shock <- shock |> mutate(shock_onset_tx_unit = factor(case_when(
+  shock_onset_unit_type == "ED" ~ "ED",
+  shock_onset_unit_type == "ICU" &
+    grepl("MICU|CCU", shock_onset_icu_group) ~ "Medical/Cardiac ICU",
+  shock_onset_unit_type == "ICU" &
+    grepl("SICU|CVICU", shock_onset_icu_group) ~ "Surgical ICU",
+  shock_onset_unit_type == "ICU" ~ "Mixed Med/Surg ICU",
+  shock_onset_unit_type == "Ward" ~ "Ward",
+  is.na(shock_onset_unit_type) & 
+    sepsis_onset_unit_type == "ED" ~ "ED",
+  is.na(shock_onset_unit_type) &
+    grepl("MICU|CCU", sepsis_onset_icu_group) ~ "Medical/Cardiac ICU",
+  is.na(shock_onset_unit_type) &
+    grepl("SICU|CVICU", sepsis_onset_icu_group) ~ "Surgical ICU",
+  is.na(shock_onset_unit_type) &
+    sepsis_onset_unit_type == "ICU" ~ "Mixed Med/Surg ICU",
+  is.na(shock_onset_unit_type) & 
+    sepsis_onset_unit_type == "Ward" ~ "Ward",
+  .default = NA
+  ))) |>
+  select(-c(sepsis_onset_unit_type, sepsis_onset_icu_group,
+            shock_onset_unit_type, shock_onset_icu_group))
+```
+
+Now show the distribution of values to ensure expectations are met.
+
+```{r}
+shock |> tabyl(shock_onset_tx_unit) |> adorn_pct_formatting() |> 
+  adorn_totals() |> 
+  rename("Shock Onset Treatment Unit" = "shock_onset_tx_unit") |>
+  kable(align = c('lcc')) |>
+  kable_paper(full_width = FALSE)
+```
+
+There are only four (\<0.01%) missing values for this vector and the distribution matches expectations.
+
+#### Hospital Characteristics
+
+First, join characteristics of the hospital at shock onset. In the rare case of a missing hospital at shock, use hospital at sepsis onset since this hospital is either the same or the hospital immediately preceding a care transfer. Then, remove the `sepsis_onset_hospital` vector because it won't be used moving forward.
+
+```{r}
+shock <- shock |>
+  mutate(shock_onset_hospital = if_else(is.na(shock_onset_hospital),
+                                        sepsis_onset_hospital,
+                                        shock_onset_hospital
+                                        )
+         ) |>
+  left_join(hosp_char |> select(hospital, hosp_beds_cat, hosp_teaching_status,
+                                hosp_state),
+            by = join_by(shock_onset_hospital == hospital),
+            relationship = "many-to-one"
+  ) |>
+  rename(shock_onset_hosp_beds_cat = hosp_beds_cat,
+         shock_onset_hosp_teaching_status = hosp_teaching_status,
+         shock_onset_hosp_state = hosp_state
+  ) |>
+  select(-sepsis_onset_hospital)
+```
+
+Lastly, remove the `hosp_char` tibble since it won't be used moving forward.
+
+```{r}
+rm(hosp_char)
+```
+
+### Shock Characteristics
+
+#### First Vasopressor {#sec-first-pressor}
+
+Identify the first vasopressor administered. To develop this variable, need to determine the date/time range of vasopressor administration.
+
+First, join the necessary data points from the `shock` tibble to the `pressors_courses` tibble (in a new tibble called `pressors`). 
+
+```{r}
+pressors <- pressors_courses |>
+  left_join(shock |> 
+              select(encounter_id, sepsis_window_start, sepsis_window_end),
+            by = join_by(encounter_id),
+            relationship = "many-to-one"
+            )
+```
+
+As a reference point to ensure consistency with manipulation steps below, count the number of distinct `encounter_id`s in the `pressors` tibble and ensure the `encounter_id`s match with the `shock` tibble.
+
+```{r}
+n_distinct(pressors$encounter_id)
+setequal(shock$encounter_id, pressors$encounter_id)
+```
+
+There are 35,914 distinct septic shock cases meeting either or both CDC ASE and Sepsis-3 criteria. The `encounter_id`s contained in `pressors` tibble match those in the `shock` tibble. Consistency with this count will be ensured in the subsequent work in this section.
+
+Next, create a vector for a vasopressor "course", which represents the exposure time for adjunctive vasopressors. For this step, identify overlapping vasopressor medication administration durations, which will capture a complete vasopressor "course". The call will group/append overlapping vasopressor episodes as continuation of therapy to accurately capture the overall vasopressor duration inclusive of initial and adjunctive therapy. First, create an internal vector ("iv") for the start and stop time range of an individual vasopressor medication administration (`start_stop_range`) using the `iv()` function from the `{ivs}` package. Notably, the `iv()` function creates a ["right-open" interval](https://cran.r-project.org/web/packages/ivs/vignettes/ivs.html), where the end of the interval is not included. As such, add 1 to the `stop_time` vector, which will add 1 second to the time (since the `stop_time` vector is in POSIXct format). This will ensure that the last documented administration action is captured in the `start_stop_range` vector. Then, group by `encounter_id` and locate overlapping vasopressor courses with the `iv_identify_group()` function from the `{ivs}` package. Use the "abutting = TRUE" option in the call, which treats course that are "abutting" (adjacent), but not overlapping, in time as the same episode. For example, if one vasopressor is stopped at the exact same date/time as another is started it will be regarded as a continuation of the same course. Then, recreate the "window period" for case identification with the `iv()` function. As noted above, the `iv()` function creates a ["right-open" interval](https://cran.r-project.org/web/packages/ivs/vignettes/ivs.html), where the end of the interval is not included. This detail is not important for cases identified with only CDC ASE criteria (or both criteria) because the "window period" is based on calendar dates, but it could be important for the Sepsis-3 criteria because the "window period" for these criteria is based on hours (with the minutes at the end of the interval inclusive of the interval). As such, to accommodate the Sepsis-3 "window period", add 1 to the end date/time, which will add one minute to the internal vector (since the vector is in POSIXct format) and create an interval inclusive of the ending time point. Next, determine if the vasopressor course overlapped with the "window period" for case identification (whether CDC ASE or Sepsis-3) with the `iv_pairwise_overlaps()` function. Since the vasopressor course may start before or during the "window period", use the type = "any" option as part of the `iv_pairwise_overlaps()` function. Then calculate the vasopressor duration in hours (`pressors_dur_hours`) based on the `pressors_range` vector. Lastly, filter the tibble to only observations (vasopressor administrations) where the course overlapped with the "window period" and the vasopressor course meeting this criterion was the first (minimum) for the case (`encounter_id`), and remove vectors that will not be used moving forward.
+
+```{r}
+pressors <- pressors |>
+  mutate(start_stop_range = iv(start_time, stop_time + 1)) |>
+  group_by(encounter_id) |>
+  mutate(pressors_range = iv_identify_group(start_stop_range, abutting = TRUE),
+         sepsis_window = iv(sepsis_window_start, sepsis_window_end + 1),
+         pressor_during_window = 
+           iv_pairwise_overlaps(pressors_range, sepsis_window, type = "any"),
+         pressors_dur_hours = 
+           as.duration(iv_start(pressors_range) %--% iv_end(pressors_range)) /
+                          dhours(1)
+         ) |>
+  filter(pressor_during_window == TRUE) |>
+  filter(pressors_range == min(pressors_range)) |>
+  ungroup() |> 
+  arrange(encounter_id, pressors_range, start_time) |> 
+  select(-c(start_stop_range, sepsis_window_start, sepsis_window_end, 
+         sepsis_window, pressor_during_window
+         ))
+```
+
+The `pressors` tibble now only includes the first vasopressor course that was administered during a time that overlapped with the sepsis "window period".
+
+Now adjudicate the first vasopressor medication during the vasopressor course, which is useful for aligning adjunctive vasopressor use and timing. In the call, also identify cases where multiple vasopressors are started first at the same time (as `multiple_first`).
+
+```{r}
+pressors <- pressors |>
+  group_by(encounter_id, pressors_range) |>
+  mutate(temp1 = if_else(start_time == iv_start(pressors_range), 1, 0),
+         temp2 = if_else(cumsum(temp1) >1, "Yes", "No"),
+         multiple_first = if_else(any(temp2 == "Yes"), "Yes", "No")
+         ) |>
+  select(-temp1, -temp2) |>
+  mutate(first_pressor = if_else(start_time == iv_start(pressors_range),
+                                   medication, NA
+                                 ),
+         .after = pressors_range
+         ) |>
+  fill(first_pressor, .direction = "down") |>
+  ungroup()
+```
+
+Next, reconcile the case with multiple first vasopressors (`multiple_first` == "Yes"). Since norepinephrine has been recommended by the Surviving Sepsis Campaign Guidelines throughout the cohort time period as a first-line vasopressor, if this vasopressor is present, consider the first vasopressor norepinephrine. Second, since at one time dopamine was recommended as a first-line vasopressor, consider dopamine the first vasopressor if norepinephrine is not present. Then consider other vasopressors according to this hierarchy corresponding to recommendations in the Surviving Sepsis Campaign Guidelines: epinephrine, phenylephrine, then vasopressin. Lastly, remove the `multiple_first` vector since it won't be used moving forward.
+
+```{r}
+pressors <- pressors |>
+  group_by(encounter_id) |>
+  mutate(first_pressor = factor(case_when(
+    multiple_first == "Yes" & 
+      any(first_pressor == "norepinephrine") ~ "norepinephrine",
+    multiple_first == "Yes" & 
+      any(first_pressor == "dopmaine") ~ "dopamine",
+    multiple_first == "Yes" & 
+      any(first_pressor == "epinephrine") ~ "epinephrine",
+    multiple_first == "Yes" & 
+      any(first_pressor == "phenylephrine") ~ "phenylephrine",
+    multiple_first == "Yes" & 
+      any(first_pressor == "vasopressin") ~ "vasopressin",
+    .default = first_pressor
+      ))) |>
+  ungroup() |>
+  select(-multiple_first)
+```
+
+Check that the encounters retained are correct.
+
+```{r}
+setequal(shock$encounter_id, pressors$encounter_id)
+```
+
+Good, the correct encounters were retained with the call. Next, review the count for first vasopressor medication.
+
+```{r}
+pressors |>  
+  tabyl(first_pressor) |> adorn_totals() |> adorn_pct_formatting() |>
+  kable(align = c('lcc'),
+        caption = "First Vasopressor"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+The count of first vasopressor is very similar, but not exactly the same as the count in the "Either CDC ASE or Sepsis-3 Criteria" septic shock group reported in the case identification work for this project. The reason for the minor discrepancy likely relates to a difference in the arrangement (ordering) of `encounter_id`s prior to the application of the `distinct()` function in the original work, which influences which medication is tabulated in cases where multiple vasopressor drugs were administered first.
+
+Join the vasopressor course vectors created in this section to the `shock` tibble.
+
+```{r}
+shock <- shock |>
+  left_join(pressors |> distinct(encounter_id, .keep_all = TRUE) |>
+              select(encounter_id, first_pressor, pressors_range,
+                     pressors_dur_hours
+                     ),
+            by = join_by(encounter_id),
+            relationship = "one-to-one"
+            )
+```
+
+Lastly, remove the `pressors_courses` tibble since it won't be used moving forward.
+
+```{r}
+rm(pressors_courses)
+```
+
+#### Adjunctive Vasopressor 
+
+Next, adjudicate adjunctive vasopressor use. The vasopressor medication start and stop time data are in long format, but the data need to be in wide format for this adjudication. The call below converts to a wide format for the start of each vasopressor medication. When there are multiple administrations of the same vasopressor, only keep the first administration (the earliest `start_time`, which is the "values_fn = min" portion of the call).
+
+```{r}
+pressors_wide <- pressors |>
+  rename(start = start_time, stop = stop_time) |>
+  pivot_wider(
+    id_cols = c(encounter_id, pressors_range, pressors_dur_hours, 
+                first_pressor
+                ),
+    names_from = medication,
+    values_from = c(start, stop),
+    names_glue = "{medication}_{.value}",
+    values_fn = min
+    )
+```
+
+First, create internal vectors for each vasopressor start time.
+
+```{r}
+pressors_wide <- pressors_wide |>
+  mutate(ne_start_iv = iv(norepinephrine_start, norepinephrine_start + 1),
+         avp_start_iv = iv(vasopressin_start, vasopressin_start + 1),
+         epi_start_iv = iv(epinephrine_start, epinephrine_start + 1),
+         pe_start_iv = iv(phenylephrine_start, phenylephrine_start + 1),
+         da_start_iv = iv(dopamine_start, dopamine_start + 1)
+         )
+```
+
+Next, assess adjunctive vasopressor use (including third through fifth line vasopressor use) based on the individual vasopressor start time being within the `pressors_range` internal vector time period.
+
+```{r}
+pressors_wide <- pressors_wide |>
+  mutate(
+    adj_avp = if_else(
+      first_pressor != "vasopressin" &
+        iv_pairwise_overlaps(avp_start_iv, pressors_range,
+                             type = "within") == TRUE, 1, 0),
+    adj_avp = if_else(is.na(adj_avp), 0, adj_avp),
+    adj_epi = if_else(
+      first_pressor != "epinephrine" &
+        iv_pairwise_overlaps(epi_start_iv, pressors_range,
+                             type = "within") == TRUE, 1, 0),
+    adj_epi = if_else(is.na(adj_epi), 0, adj_epi),
+    adj_pe = if_else(
+      first_pressor != "phenylephrine" &
+        iv_pairwise_overlaps(pe_start_iv, pressors_range,
+                             type = "within") == TRUE, 1, 0),
+    adj_pe = if_else(is.na(adj_pe), 0, adj_pe),
+    adj_da = if_else(
+      first_pressor != "dopamine" &
+        iv_pairwise_overlaps(da_start_iv, pressors_range,
+                             type = "within") == TRUE, 1, 0),
+    adj_da = if_else(is.na(adj_da), 0, adj_da),
+    adj_ne = if_else(
+      first_pressor != "norepinephrine" &
+        iv_pairwise_overlaps(ne_start_iv, pressors_range,
+                             type = "within") == TRUE, 1, 0),
+    adj_ne = if_else(is.na(adj_ne), 0, adj_ne)
+    ) |> 
+  select(-(ends_with("_iv")))
+```
+
+Now, determine the time to adjunctive agent initiation, which is a necessary step to calculate the "second-line" (first adjunct) vasopressor.
+
+```{r}
+pressors_wide <- pressors_wide |>
+  mutate(time_to_adj_ne = 
+           if_else(adj_ne == 1,
+                   round_half_up(
+                     as.duration(iv_start(pressors_range) %--% 
+                                   norepinephrine_start) / dhours(1), 2),
+                   NA),
+         time_to_adj_avp = 
+           if_else(adj_avp == 1,
+                   round_half_up(
+                     as.duration(iv_start(pressors_range) %--% 
+                                   vasopressin_start) / dhours(1), 2),
+                   NA),
+         time_to_adj_epi = 
+           if_else(adj_epi == 1,
+                   round_half_up(
+                     as.duration(iv_start(pressors_range) %--% 
+                                   epinephrine_start) / dhours(1), 2),
+                   NA),
+         time_to_adj_pe = 
+           if_else(adj_pe == 1,
+                   round_half_up(
+                     as.duration(iv_start(pressors_range) %--% 
+                                   phenylephrine_start) / dhours(1), 2),
+                   NA),
+         time_to_adj_da = 
+           if_else(adj_da == 1,
+                   round_half_up(
+                     as.duration(iv_start(pressors_range) %--% 
+                                   dopamine_start) / dhours(1), 2),
+                   NA)
+         )
+```
+
+Then, assign adjunctive vasopressor use a rank based on the time to initiation after shock onset (vasopressor initiation). In this call, one will be added to the rank because the formula calculates the first medication based on time. Since only adjuncts are evaluated, an initial (first) vasopressor was already administered, and the logical order for adjuncts will be second or higher.
+
+```{r}
+# Reshape to long format (required for ranking)
+pressors_long <- pivot_longer(pressors_wide,
+                              cols = starts_with("time_to"), 
+                              names_to = "Variable",
+                              values_to = "Date")
+
+# Rank the dates/times within each encounter_id
+pressors_long <- pressors_long |>
+  group_by(encounter_id) |>
+  mutate(Rank = rank(Date))
+
+# Reshape back to wide format and assign to main tibble name
+pressors <- pivot_wider(pressors_long,
+                        names_from = Variable, values_from = c(Date, Rank)) |>
+  rename(time_to_adj_ne = Date_time_to_adj_ne,
+         time_to_adj_avp = Date_time_to_adj_avp,
+         time_to_adj_epi = Date_time_to_adj_epi,
+         time_to_adj_pe = Date_time_to_adj_pe,
+         time_to_adj_da = Date_time_to_adj_da
+         ) |>
+  mutate(adj_ne_order = if_else(adj_ne == 0, NA, Rank_time_to_adj_ne + 1),
+         adj_avp_order = if_else(adj_avp == 0, NA, Rank_time_to_adj_avp + 1),
+         adj_epi_order = if_else(adj_epi == 0, NA, Rank_time_to_adj_epi + 1),
+         adj_pe_order = if_else(adj_pe == 0, NA, Rank_time_to_adj_pe + 1),
+         adj_da_order = if_else(adj_da == 0, NA, Rank_time_to_adj_da + 1)
+         ) |>
+  select(-Rank_time_to_adj_ne, -Rank_time_to_adj_avp, -Rank_time_to_adj_epi,
+         -Rank_time_to_adj_pe, -Rank_time_to_adj_da
+         )
+
+# Remove long and wide tibbles
+rm(pressors_long, pressors_wide)
+```
+
+Next, adjudicate any adjunct presence and time to first adjunct. If an adjunct was not present/used, then the time to first adjunct will be NA.
+
+```{r}
+pressors <- pressors |>
+  group_by(encounter_id, first_pressor) |>
+  mutate(any_adj = 
+           factor(if_else(any(adj_ne == 1, adj_avp == 1, adj_epi == 1,
+                              adj_pe == 1, adj_da == 1), 
+                          "Adjunct", "No Adjunct"
+                          )),
+         hours_to_first_adj = 
+           if_else(any_adj == "Adjunct",
+                   pmin(time_to_adj_ne, time_to_adj_avp,time_to_adj_epi, 
+                        time_to_adj_pe, time_to_adj_da, na.rm = TRUE
+                        ),
+                   NA
+                   )
+         ) |>
+  ungroup()
+```
+
+To ensure expectations are met, explore distribution of `hours_to_first_adj`.
+
+```{r}
+#| message: false
+
+mosaic::favstats(~hours_to_first_adj, data = pressors) |>
+  kable(digits = 2, align = c('lccccccccc'),
+        caption = "Numeric Summary of Hours to First Vasopressor Adjunct"
+        ) |> 
+  kable_paper(full_width = FALSE)
+```
+
+First, there are missing values, which correspond to observations without adjunctive vasopressor administration. Second, the minimum value zero, which corresponds to observations with multiple first vasopressors administered. 
+
+Next, determine the vasopressor drug used as the first adjunctive vasopressor (corresponding to the second vasopressor administered). In some observations more than one vasopressor was first administered as adjunctive therapy at the same time, which will be account for in the call below. Notably, although the below call doesn't adjudicate all combination possibilities, it does adjudicate all observed combination possibilities (and future applications will not use this variable).
+
+```{r}
+pressors <- pressors |> 
+  mutate(first_adj = fct_infreq(factor(case_when(
+    adj_ne_order == 2 ~ "norepinephrine",
+    adj_avp_order == 2 ~ "vasopressin",
+    adj_epi_order == 2 ~ "epinephrine",
+    adj_pe_order == 2 ~ "phenylephrine",
+    adj_da_order == 2 ~ "dopamine",
+    adj_ne_order == 2.5 & adj_avp_order == 2.5 ~ "NE + AVP",
+    adj_ne_order == 2.5 & adj_epi_order == 2.5  ~ "NE + Epi",
+    adj_ne_order == 2.5 & adj_pe_order == 2.5 ~ "NE + PE",
+    adj_ne_order == 2.5 & adj_da_order == 2.5 ~ "NE + DA",
+    adj_avp_order == 2.5 & adj_epi_order == 2.5 ~ "AVP + Epi",
+    adj_avp_order == 2.5 & adj_pe_order == 2.5 ~ "AVP + PE",
+    adj_avp_order == 2.5 & adj_da_order == 2.5 ~ "AVP + DA",
+    adj_epi_order == 2.5 & adj_pe_order == 2.5 ~ "Epi + PE",
+    adj_epi_order == 2.5 & adj_da_order == 2.5 ~ "Epi + DA",
+    adj_pe_order == 2.5 & adj_ne_order == 2.5 ~ "PE + DA",
+    adj_ne_order == 3 & adj_avp_order == 3 & 
+      adj_epi_order == 3 ~ "NE + AVP + Epi",
+    adj_ne_order == 3 & adj_avp_order == 3 & 
+      adj_pe_order == 3 ~ "NE + AVP + PE",
+    adj_avp_order == 3 & adj_epi_order == 3 &
+      adj_pe_order == 3 ~ "AVP + Epi + PE",
+    .default = NA
+  ))),
+  .after = any_adj
+  )
+```
+
+Now, join the pertinent vectors created in the `pressors` tibble to the `shock` tibble. 
+
+```{r}
+shock <- shock |>
+  left_join(pressors |> 
+              select(encounter_id, any_adj, first_adj, hours_to_first_adj),
+            by = join_by(encounter_id),
+            relationship = "one-to-one"
+            )
+```
+
+#### Guideline Treatment Era {#sec-ssc-era}
+
+Septic shock treatment is guided by the Surviving Sepsis Campaign International Guidelines. Four iterations of guidelines were published during the study time period (2012-2024), each with different recommendations for treatment of shock, including the use of adjunctive vasopressors. The common names of the guidelines, publication month/year, and recommendations/suggestions related to adjunctive vasopressor use (with their grading) are outlined below.
+
+-   [2008 (published 04 December 2007)](https://link.springer.com/article/10.1007/s00134-007-0934-2): *Vasopressin 0.03 units/min may be subsequently added to norepinephrine with anticipation of an effect equivalent to norepinephrine alone. Use epinephrine as the first alternative agent in septic shock when blood pressure is poorly responsive to norepinephrine or dopamine (2B).*
+-   [2012 (published 30 January 2013)](https://link.springer.com/article/10.1007/s00134-012-2769-8): *Epinephrine (added to and potentially substituted for norepinephrine) when an additional agent is needed to maintain adequate blood pressure (grade 2B). Vasopressin 0.03 units/minute can be added to norepinephrine (NE) with intent of either raising MAP or decreasing NE dosage (UG).*
+-   [2016 (published 18 January 2017)](https://link.springer.com/article/10.1007/s00134-017-4683-6): *We suggest adding either vasopressin (up to 0.03 U/min) (weak recommendation, moderate quality of evidence) or epinephrine (weak recommendation, low quality of evidence) to norepinephrine with the intent of raising MAP to target, or adding vasopressin (up to 0.03 U/min) (weak recommendation, moderate quality of evidence) to decrease norepinephrine dosage.*
+-   [2021 (published 02 October, 2021)](https://link.springer.com/article/10.1007/s00134-021-06506-y): *For adults with septic shock on norepinephrine with inadequate mean arterial pressure levels, we suggest adding vasopressin instead of escalating the dose of norepinephrine. (Weak, moderate quality evidence) For adults with septic shock and inadequate mean arterial pressure levels despite norepinephrine and vasopressin, we suggest adding epinephrine. (Weak, moderate quality evidence)*
+
+Create a categorical vector for the Surviving Sepsis Campaign guideline "era" (`ssc_era`) based on the patient admission date and guideline publication date. Then remove the `admission_time` vector because it won't be used moving forward.
+
+```{r}
+shock <- shock |>
+  mutate(ssc_era = factor(case_when(
+    admission_time > as.Date("2021-10-02") ~ "SSC 2021",
+    admission_time > as.Date("2017-01-18") ~ "SSC 2016",
+    admission_time > as.Date("2013-01-30") ~ "SSC 2012",
+    admission_time > as.Date("2007-12-04") ~ "SSC 2008",
+    .default = "Error"
+  ))
+         ) |>
+  select(-admission_time)
+```
+
+Tabulate `ssc_era` to ensure no "Error" appears and counts match expectations.
+
+```{r}
+shock |> tabyl(ssc_era) |>
+  adorn_pct_formatting() |> 
+  adorn_totals() |> 
+  rename("Surviving Sepsis Campaign Guideline Era" = "ssc_era") |>
+  kable(align = c('lcc')) |>
+  kable_paper(full_width = FALSE)
+```
+
+No "Error" appears and the counts match expectations.
+
+### Refractory Septic Shock {#sec-rss}
+
+Here, determine the presence (or not) of refractory septic shock based on the clinical criteria. Per the ESICM/SCCM Delphi consensus document (under peer review): "Refractory septic shock is defined by the presence of persistently high lactate concentrations and or prolonged capillary refill time in a patient with septic shock who is no longer fluid responsive, receiving at least a norepinephrine (base) equivalent dose > 0.5 µg/kg/min and with confirmation by [critical care ultrasound] in case of mixed shock." This will be operationalized as the simultaneous occurrence of both 1) norepinephrine (base) equivalent (NEE) >0.5 mcg/kg/min based on the Kotani equivalence equation ([Kotani 2023](https://pubmed.ncbi.nlm.nih.gov/36670410/)), and 2) lactate >2 mmol/L. The closest lactate value at the time of, or prior to, the documented NEE dosage will be utilized and the closest lactate value must be collected within the prior 6 hours.
+
+First, ensure the vasopressor administrations in the `pressors_doses` tibble correspond to the vasopressor course that was initiated during the sepsis "window period". The vasopressor course is represented as `pressors_range` in the `shock` tibble, therefore will join this vector to the `pressors_doses` tibble.
+
+```{r}
+pressors_doses <- pressors_doses |>
+  left_join(shock |> select(encounter_id, pressors_range),
+            join_by(encounter_id),
+            relationship = "many-to-one"
+            )
+```
+
+Next, use an approach similar to the one used above in @sec-first-pressor. First, create an internal vector for the vasopressor administration time (`mar_taken_time`) by adding one to the end of the time to create the right-open window. Second, use the `iv_pairwise_overlaps()` function with type = "within" to adjudicate if the vasopressor administration time was within the `pressors_range` interval. Then, filter to only observations meeting criteria and remove vectors that won't be used moving forward.
+
+```{r}
+pressors_doses <- pressors_doses |>
+  mutate(taken_iv = iv(mar_taken_time, mar_taken_time + 1),
+         taken_during_range = 
+           iv_pairwise_overlaps(taken_iv, pressors_range, type = "within")
+         ) |>
+  filter(taken_during_range == TRUE) |> 
+  select(-c(taken_iv, taken_during_range, pressors_range))
+```
+
+Check that the encounters retained are correct.
+
+```{r}
+setequal(shock$encounter_id, pressors_doses$encounter_id)
+```
+
+Join pertinent lactate values from the `lactate` tibble to the `pressors_doses` tibble. Each documented vasopressor dose (by `mar_taken_time`) can have multiple lactate values meeting criteria, and each lactate value can have multiple documented vasopressor doses meeting criteria, therefore specify the relationship as "many-to-many". Then arrange by descending `lactate` value to have the highest value as the first observation (when multiple observations met criteria), and reduce the tibble back to distinct observations. 
+
+```{r}
+pressors_doses <- 
+  left_join(pressors_doses |> 
+              mutate(taken_minus6h = mar_taken_time - hours(6)),
+            lactate |> select(encounter_id, lactate, lactate_time),
+            join_by(encounter_id,
+                    closest(mar_taken_time >= lactate_time),
+                    taken_minus6h <= lactate_time),
+            relationship = "many-to-many") |>
+  arrange(encounter_id, mar_taken_time, desc(lactate)) |>
+  distinct(encounter_id, mar_taken_time, medication, .keep_all = TRUE) |>
+  select(-taken_minus6h)
+```
+
+To determine the presence of refractory septic shock on the observation level (`obs_rss`) , adjudicate the row-wise presence of both `running_nee_kotani` >0.5 and `lactate` >2.
+
+```{r}
+pressors_doses <- pressors_doses |>
+  mutate(obs_rss = 
+           factor(case_when(
+             running_nee_kotani >0.5 & lactate >2 ~ "Yes",
+             .default = "No"))
+         )
+```
+
+Then, determine the presence of any observation meeting the criteria for refractory septic shock on the patient (`encounter_id`) level (`pt_rss`).
+
+```{r}
+pressors_doses <- pressors_doses |>
+  group_by(encounter_id) |>
+  mutate(pt_rss = 
+           factor(if_else(any(obs_rss == "Yes"), "RSS Present", "No RSS"))
+         ) |>
+  ungroup()
+```
+
+Determine on the `encounter_id` level the first instance of refractory septic shock criteria being met. This is cleanest to do in two steps - first with `summarise()`, then join the result back to the `pressors_doses` tibble and remove the intermediary tibble.
+
+```{r}
+rss_times <- pressors_doses |>
+  filter(obs_rss == "Yes") |>
+  group_by(encounter_id) |>
+  summarise(
+    pt_rss_time = min(mar_taken_time, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pressors_doses <- pressors_doses |>
+  left_join(rss_times, by = "encounter_id") |>
+  mutate(pt_rss_time = if_else(obs_rss == "Yes", pt_rss_time, as.POSIXct(NA)))
+
+rm(rss_times)
+```
+
+For sensitivity analyses of the criteria, also adjudicate the presence of refractory shock with a) NEE calculated with the equivalence equation from [Goradia 2021](https://pubmed.ncbi.nlm.nih.gov/33220576/), and b) lactate concentration >4 (with the NEE calculated per the primary method using the Kotani equivalence equation). Using `case_when()` instead of `if_else()` here such that the NA values are included in the default of "No".
+
+```{r}
+pressors_doses <- pressors_doses |>
+  mutate(
+    obs_rss_sens_goradia = factor(case_when(
+      running_nee_goradia >0.5 & lactate >2 ~ "Yes", 
+      .default = "No")),
+    obs_rss_sens_lactate4 = factor(case_when(
+      running_nee_kotani >0.5 & lactate >4 ~ "Yes", 
+      .default = "No"))
+    ) |>
+  group_by(encounter_id) |>
+  mutate(pt_rss_sens_goradia = 
+           factor(if_else(any(obs_rss_sens_goradia == "Yes"), 
+                          "RSS Present", "No RSS"
+                          )),
+         pt_rss_sens_lactate4 = 
+           factor(if_else(any(obs_rss_sens_lactate4 == "Yes"), 
+                          "RSS Present", "No RSS"
+                          ))
+         ) |>
+  ungroup()
+```
+
+For an additional sensitivity analysis, also adjudicate the presence of refractory shock with a minimum vasopressor duration of 1 hour prior to criteria eligibility (with the NEE calculated per the primary method using the Kotani equivalence equation).
+
+```{r}
+pressors_doses <- pressors_doses |>
+  group_by(encounter_id) |>
+  mutate(running_dur_hours = 
+           as.duration(min(mar_taken_time) %--% mar_taken_time) / dhours(1)
+         ) |>
+  ungroup() |>
+  mutate(obs_rss_sens_dur1h = factor(case_when(
+   running_nee_kotani >0.5 & lactate >2 & running_dur_hours >=1 ~ "Yes",
+   .default = "No"
+   ))) |>
+  group_by(encounter_id) |>
+  mutate(pt_rss_sens_dur1h = 
+           factor(if_else(any(obs_rss_sens_dur1h == "Yes"), 
+                          "RSS Present", "No RSS"
+                          ))
+         ) |>
+  ungroup()
+```
+
+
+Confirm that the encounters retained are correct.
+
+```{r}
+setequal(shock$encounter_id, pressors_doses$encounter_id)
+```
+
+Then join the patient-level variables created in this sub-section to the `shock` tibble. As part of the call need to arrange by descending `pt_rss_time` to bring the time to the top row when present (instead of NAs), then apply `distinct()`. Arranging in this way does not affect the other patient-level variables (because they are adjudicated on the patient level).
+
+```{r}
+shock <- shock |>
+  left_join(pressors_doses |> 
+              select(encounter_id, pt_rss, pt_rss_time, pt_rss_sens_goradia,
+                     pt_rss_sens_lactate4, pt_rss_sens_dur1h
+                     ) |>
+              arrange(encounter_id, desc(pt_rss_time)) |>
+              distinct(encounter_id, .keep_all = TRUE),
+            join_by(encounter_id),
+            relationship = "one-to-one"
+            )
+```
+
+Lastly, when refractory septic shock is present on the patient level (`pt_rss` == "RSS Present"), calculate the time to refractory septic shock criteria being met from shock onset (vasopressor initiation).
+
+```{r}
+shock <- shock |>
+  mutate(hours_to_rss = if_else(pt_rss == "RSS Present",
+                                round_half_up(
+                                  as.duration(iv_start(pressors_range) %--%
+                                                pt_rss_time) / dhours(1), 2),
+                                NA
+                                )
+         )
+
+```
+
+### Additional Descriptors
+
+#### Highest NEE and Lactate
+
+In this sub-section determine the highest vasopressor dosage (NEE) and lactate concentration on the `encounter_id` level during vasopressor administration. The easiest approach is to do this in two steps, similar to the calculation of `pt_rss_time` above in @sec-rss; first with `summarise()`, then join the result to the `shock` tibble and remove the intermediary tibble. Of note, when `running_nee_kotani` cannot be calculated due to missing body weight data, all documented doses in `pressors_doses` are NA except the last dose with a "stop" action, which has a dose of zero. As such, treat all maximum NEE values of zero as missing. Similarly, with `summarise()` missing values for maximum lactate are assigned a value of "-Inf", which will also be treated as missing. Then remove tibbles that will not be used moving forward.
+
+```{r}
+#| message: false
+#| warning: false
+
+max_nee <- pressors_doses |>
+  group_by(encounter_id) |>
+  summarise(
+    encounter_max_nee = max(running_nee_kotani, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(encounter_max_nee = na_if(encounter_max_nee, 0))
+
+max_lactate <- lactate |> 
+  group_by(encounter_id) |>
+  summarise(
+    encounter_max_lactate = max(lactate, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(encounter_max_lactate = na_if(encounter_max_lactate, -Inf))
+
+shock <- shock |>
+  left_join(max_nee, 
+            join_by("encounter_id"),
+            relationship = "one-to-one"
+            )
+
+shock <- shock |>
+  left_join(max_lactate, 
+            join_by("encounter_id"),
+            relationship = "one-to-one"
+            )
+
+rm(max_nee, max_lactate, pressors_doses, lactate)
+```
+
+#### Corticosteroids
+
+Determine the presence of at least one parenteral or enteral dose of any glucocorticoid medication administered between vasopressor initiation and cessation. All observations in the `steroids` tibble represent parenteral or enteral administration of a glucocorticoid medication (also known as a "corticosteroid", or, simply "steroid").
+
+First, join the `pressors_range` internal vector from the `pressors` tibble to the `steroids` tibble and create an internal vector for each steroid administration time with a similar approach as described above.
+
+```{r}
+steroids <- steroids |>
+  left_join(pressors |> select(encounter_id, pressors_range),
+            join_by(encounter_id),
+            relationship = "many-to-one") |>
+  mutate(steroid_taken_iv = iv(mar_taken_time, mar_taken_time +1))
+```
+
+Next, assess steroid administration within the vasopressor course based on the steroid MAR taken time being within the `pressors_range` internal vector time period and filter the `steroids` tibble to only observations meeting this criterion.
+
+```{r}
+steroids <- steroids |>
+  mutate(during_pressors = if_else(
+    iv_pairwise_overlaps(steroid_taken_iv, pressors_range,
+                         type = "within"
+                         ) == TRUE,
+    1, 0)) |>
+  filter(during_pressors == 1)
+```
+    
+Lastly, create a vector within the `shock` tibble for steroid administration during the vasopressor course (`steroid_during_pressors`) and remove the `steroid` and `pressors` tibbles because they won't be used moving forward.
+
+```{r}
+shock <- shock |>
+  mutate(steroid_during_pressors = 
+           factor(if_else(encounter_id %in% steroids$encounter_id,
+                          "Steroids Given", "No Steroids Given"
+                          ))
+         )
+rm(steroids, pressors)
+```
+
+# Eligibility Criteria
+
+The goal of this work is to assess refractory septic shock in adults with septic shock. Eligibility criteria will be outlined below and subsequently applied in a code chunk.
+
+1)  Adults (age ≥18 years)
+
+-   The initial data queries for cohort identification applied an age restriction of ≥18 years at encounter onset. However, to ensure criteria met and for transparency an eligibility criterion for `age` ≥18 will be utilized.
+
+
+2)  Septic shock per clinical criteria
+
+-   Septic shock clinical criteria per CDC ASE and Sepsis-3 clinical criteria were applied in previous work to create the `shock` tibble ([Bauer 2025](https://link.springer.com/article/10.1186/s13054-025-05749-1)). Of note, the previous work also restricted cases to the first sepsis encounter on the patient level.
+-   Restrict inclusion to patient cases meeting **both** CDC ASE and Sepsis-3 clinical criteria. Although there is no consensus for retrospective septic shock case classification, fulfillment of multiple criteria can increase confidence in syndrome identification. 
+
+3)  Weight-based vasopressor dosage available
+
+-   Because vasopressor dosage (expressed as NEE) is a component of the primary exposure variable, exclude cases where these data are missing. 
+
+4)  Hospital discharge disposition available
+
+-   Because hospital mortality is the primary comparative outcome of interest, exclude cases where these data are missing. 
+
+In the call below, adjudicate and tabulate eligibility criteria.
+
+```{r}
+shock <- shock |> 
+  mutate(elig = case_when(
+    age <18 ~ "exclude-1_age_<18",
+    criteria_met != "Both" ~ "exclude-2_both_criteria_not_met",
+    is.na(encounter_max_nee) ~ "exclude-3_nee_missing",
+    is.na(dc_dispo_f) ~ "exclude-4_discharge_dispo_missing",
+    .default = "include"
+  ))
+
+shock |> 
+  distinct(encounter_id, .keep_all = TRUE) |>
+  tabyl(elig) |> adorn_totals() |> adorn_pct_formatting() |>
+  rename("Eligibility Criteria" = elig) |>
+  kable(align = c('lcc'),
+        caption = "Eligibility Adjudication"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+Apply eligibility criteria to create analytic tibble (`incl`), remove vectors that were used to assess eligibility (since they will be uniform), and drop unused levels of categorical variables.
+
+```{r}
+incl <- shock |>
+  filter(elig == "include") |>
+  select(-c(elig, criteria_met)) |>
+  droplevels()
+```
+
+# Data Structure
+
+Assess data structure in analytic tibble (`incl`) to ensure the vectors are in the desired format for analysis.
+
+```{r}
+str(incl, vec.len = 0)
+```
+
+All vectors are in the desired structure for analyses.
+
+# Setting Characteristics
+
+Count the number of distinct healthcare locations (settings) from which the data were derived, by state.
+
+```{r}
+incl |>
+  summarise(
+    n_settings = n_distinct(shock_onset_hospital),
+    .by = shock_onset_hosp_state
+  ) |>
+  rename("State" = shock_onset_hosp_state,
+         "Treatment Locations (n)" = n_settings) |>
+  kable(align = c('lc'),
+        caption = "Count of Locations by State"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+Included patients were treated in 18 distinct locations in Ohio and 5 distinct locations in Florida.
+
+# Incidence of Refractory Septic Shock
+
+Calculate the co-primary outcome of the incidence of refractory septic shock (`pt_rss`) in patients with septic shock.
+
+```{r}
+incl |> tabyl(pt_rss) |>
+  adorn_pct_formatting() |> adorn_totals() |>
+  rename("Refractory Septic Shock (RSS)" = pt_rss) |>
+  kable(align = c('lcc'),
+        caption = "Incidence of Refractory Septic Shock"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+## Sensitivity Analyses
+
+1) Calculate refractory septic shock incidence in the sensitivity analysis where NEE was calculated per the Goradia equation (`pt_rss_sens_goradia`).
+
+```{r}
+incl |> tabyl(pt_rss_sens_goradia) |>
+  adorn_pct_formatting() |> adorn_totals() |>
+  rename("Refractory Septic Shock (RSS)" = pt_rss_sens_goradia) |>
+  kable(align = c('lcc'),
+        caption = "Sensitivity Analysis: Incidence of Refractory Septic Shock (Goradia NEE)"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+2) Calculate refractory septic shock incidence in the sensitivity analysis where a lactate concentration threshold >4 mmol/L was utilized (`pt_rss_sens_lactate4`).
+
+```{r}
+incl |> tabyl(pt_rss_sens_lactate4) |>
+  adorn_pct_formatting() |> adorn_totals() |>
+  rename("Refractory Septic Shock (RSS)" = pt_rss_sens_lactate4) |>
+  kable(align = c('lcc'),
+        caption = "Sensitivity Analysis: Incidence of Refractory Septic Shock (Lactate >4)"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+3) Calculate refractory septic shock incidence in the sensitivity analysis where a minimum vasopressor duration of 1 hour was utilized (`pt_rss_sens_dur1h`).
+
+```{r}
+incl |> tabyl(pt_rss_sens_dur1h) |>
+  adorn_pct_formatting() |> adorn_totals() |>
+  rename("Refractory Septic Shock (RSS)" = pt_rss_sens_dur1h) |>
+  kable(align = c('lcc'),
+        caption = "Sensitivity Analysis: Incidence of Refractory Septic Shock (Duration ≥1 Hour)"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+# Time to Refractory Septic Shock
+
+Describe the time (in hours) from vasopressor initiation to meeting clinical criteria for refractory septic shock (restricted to patients meeting criteria).
+
+```{r}
+#| message: false
+
+mosaic::favstats(~hours_to_rss, 
+                 data = incl |> filter(pt_rss == "RSS Present")
+                 ) |>
+  kable(digits = 1, align = c('lccccccccc'),
+        caption = "Numeric Description of Hours to Refractory Septic Shock"
+        ) |> 
+  kable_paper(full_width = FALSE)
+```
+
+# Patient Characteristics {#sec-char}
+
+Describe the characteristics in the overall study population..
+
+```{r}
+(char_overall <- incl |>
+  select(age, sex, race_eth, cerebrovascular_disease, hypertension, 
+         heart_failure, chronic_pulmonary_disease, liver_disease,
+         kidney_disease, malignancy, diabetes, alcohol_abuse,
+         elixhauser_index, admit_year, ssc_era, shock_onset_hosp_state,  
+         shock_onset_hosp_beds_cat, shock_onset_hosp_teaching_status,  
+         shock_onset_tot_sofa, shock_map_closest,
+         shock_lactate_closest, first_pressor, wt_kg, 
+         mv_before_shock, shock_onset_tx_unit, 
+         encounter_max_nee, any_adj, encounter_max_lactate,
+         steroid_during_pressors, encounter_max_sofa, mv_any
+         ) |>
+  mutate(shock_onset_hosp_beds_cat = 
+           fct_relevel(shock_onset_hosp_beds_cat, "<200", "200-499"),
+         any_adj = fct_relevel(any_adj, "Adjunct"),
+         steroid_during_pressors = 
+           fct_relevel(steroid_during_pressors, "Steroids Given")
+         ) |>
+  tbl_summary(
+    digits = all_categorical() ~ c(0, 1),
+    label = list(age = "Age",
+                 sex = "Sex",
+                 race_eth = "Race/Ethnicity",
+                 elixhauser_index = "Elixhauser Comorbidity Index",
+                 ssc_era = "Surviving Sepsis Campaign Guideline Era",
+                 wt_kg = "Weight (kg)",
+                 shock_onset_hosp_state = "Hospital State",
+                 shock_onset_hosp_beds_cat = "Hospital Beds",
+                 shock_onset_hosp_teaching_status = "Teaching Status",
+                 shock_onset_tx_unit = "Shock Onset Treatment Unit",
+                 shock_onset_tot_sofa = "SOFA-1 at Shock Onset",
+                 shock_map_closest = "MAP at Shock Onset",
+                 shock_lactate_closest = "Lactate at Shock Onset",
+                 mv_before_shock = "Mechanical Ventilation at Shock Onset",
+                 encounter_max_nee = "Encounter Maximum NEE, mcg/kg/min",
+                 any_adj = "Combination Vasopressor Therapy",
+                 encounter_max_lactate = "Encounter Maximum Lactate",
+                 steroid_during_pressors = "Corticosteroid Administration",
+                 encounter_max_sofa = "Encounter Maximum SOFA-1",
+                 mv_any = "Encounter Mechanical Ventilation"
+                 )
+    ) |>
+  modify_table_body(
+    ~ .x |>
+        mutate(across(starts_with("stat_"), ~ gsub("%", "", as.character(.x))))
+    ))
+```
+
+Export to Word
+
+```{r}
+as_flex_table(char_overall) |>
+  save_as_docx(path = "characteristics_overall.docx")
+```
+
+Describe the characteristics of included patients by cohort (presence or not of refractory septic shock ["RSS"]). 
+
+```{r}
+(char_comparison <- incl |>
+  select(pt_rss, age, sex, race_eth, cerebrovascular_disease, hypertension, 
+         heart_failure, chronic_pulmonary_disease, liver_disease,
+         kidney_disease, malignancy, diabetes, alcohol_abuse,
+         elixhauser_index, admit_year, ssc_era, shock_onset_hosp_state,  
+         shock_onset_hosp_beds_cat, shock_onset_hosp_teaching_status,  
+         shock_onset_tot_sofa, shock_map_closest,
+         shock_lactate_closest, first_pressor, wt_kg, 
+         mv_before_shock, shock_onset_tx_unit, 
+         encounter_max_nee, any_adj, encounter_max_lactate,
+         steroid_during_pressors, encounter_max_sofa, mv_any
+         ) |>
+  mutate(pt_rss = fct_relevel(pt_rss, "RSS Present"),
+         shock_onset_hosp_beds_cat = 
+           fct_relevel(shock_onset_hosp_beds_cat, "<200", "200-499"),
+         any_adj = fct_relevel(any_adj, "Adjunct"),
+         steroid_during_pressors = 
+           fct_relevel(steroid_during_pressors, "Steroids Given")
+         ) |>
+  tbl_summary(
+    by = pt_rss,
+    digits = all_categorical() ~ c(0, 1),
+    label = list(age = "Age",
+                 sex = "Sex",
+                 race_eth = "Race/Ethnicity",
+                 elixhauser_index = "Elixhauser Comorbidity Index",
+                 ssc_era = "Surviving Sepsis Campaign Guideline Era",
+                 wt_kg = "Weight (kg)",
+                 shock_onset_hosp_state = "Hospital State",
+                 shock_onset_hosp_beds_cat = "Hospital Beds",
+                 shock_onset_hosp_teaching_status = "Teaching Status",
+                 shock_onset_tx_unit = "Shock Onset Treatment Unit",
+                 shock_onset_tot_sofa = "SOFA-1 at Shock Onset",
+                 shock_map_closest = "MAP at Shock Onset",
+                 shock_lactate_closest = "Lactate at Shock Onset",
+                 mv_before_shock = "Mechanical Ventilation at Shock Onset",
+                 encounter_max_nee = "Encounter Maximum NEE, mcg/kg/min",
+                 any_adj = "Combination Vasopressor Therapy",
+                 encounter_max_lactate = "Encounter Maximum Lactate",
+                 steroid_during_pressors = "Corticosteroid Administration",
+                 encounter_max_sofa = "Encounter Maximum SOFA-1",
+                 mv_any = "Encounter Mechanical Ventilation"
+                 )
+    ) |>
+   add_p(pvalue_fun = label_style_pvalue(digits = 2)) |>
+   modify_table_body(
+    ~ .x |>
+        mutate(across(starts_with("stat_"), ~ gsub("%", "", as.character(.x))))
+    )
+ )
+```
+
+Export to Word
+
+```{r}
+as_flex_table(char_comparison) |>
+  save_as_docx(path = "characteristics_comparison.docx")
+```
+
+# Outcomes
+
+Describe outcomes in the overall study population.
+
+```{r}
+(outcome_overall <- incl |>
+  select(mort_hosp, dc_dispo_f) |>
+  tbl_summary(
+    digits = all_categorical() ~ c(0, 1),
+    label = list(mort_hosp = "Hospital Mortality",
+                 dc_dispo_f = "Discharge Dispsition"
+                 )
+    ) |>
+  modify_table_body(
+    ~ .x |>
+        mutate(across(starts_with("stat_"), ~ gsub("%", "", as.character(.x))))
+    ))
+```
+
+Export to Word
+
+```{r}
+as_flex_table(outcome_overall) |>
+  save_as_docx(path = "outcome_overall.docx")
+```
+
+Describe outcomes by refractory septic shock cohort.
+
+```{r}
+(outcome_comparison <- incl |>
+  select(pt_rss, mort_hosp, dc_dispo_f) |>
+  mutate(pt_rss = fct_relevel(pt_rss, "RSS Present")) |>
+  tbl_summary(
+    by = pt_rss,
+    digits = all_categorical() ~ c(0, 1),
+    label = list(mort_hosp = "Hospital Mortality",
+                 dc_dispo_f = "Discharge Dispsition"
+                 )
+    ) |>
+  modify_table_body(
+    ~ .x |>
+        mutate(across(starts_with("stat_"), ~ gsub("%", "", as.character(.x))))
+    ))
+```
+
+Export to Word
+
+```{r}
+as_flex_table(outcome_comparison) |>
+  save_as_docx(path = "outcome_comparison.docx")
+```
+
+Calculate individual categorical outcome variables and adjust levels of exposure and outcomes to standard epidemiological format with level of interest (outcome presence) first. 
+
+```{r}
+outcomes_epi <- incl |>
+  mutate(pt_rss = fct_relevel(pt_rss, "RSS Present"),
+         mort_hosp = fct_relevel(factor(mort_hosp), "Died"),
+         home_dc = if_else(dc_dispo_f == "Home",1,0),
+         home_dc = fct_relevel(factor(home_dc), "1"),
+         other_facility_dc = if_else(dc_dispo_f == "Other health care facility",1,0),
+         other_facility_dc = fct_relevel(factor(other_facility_dc), "1"),
+         acute_facility_dc = if_else(dc_dispo_f == "Acute care facility",1,0),
+         acute_facility_dc = fct_relevel(factor(acute_facility_dc), "1"),
+         hospice_dc = if_else(dc_dispo_f == "Hospice",1,0),
+         hospice_dc = fct_relevel(factor(hospice_dc), "1"),
+         ama_dc = if_else(dc_dispo_f == "Against medical advice",1,0),
+         ama_dc = fct_relevel(factor(ama_dc), "1")
+         )
+```
+
+Difference in percentages and univariate odds ratios by refractory septic shock presence (or not).
+
+```{r}
+dep_vars_cat <- c("mort_hosp", "home_dc", "other_facility_dc", 
+                  "acute_facility_dc", "hospice_dc", "ama_dc"
+                  )
+
+summary_df_cat <- tibble(variable = dep_vars_cat) |>
+  mutate(
+    summary = map(variable, function(var) {
+      df <- tibble(
+        outcome = outcomes_epi[[var]],
+        group   = outcomes_epi$pt_rss
+        )
+      
+      res <- twoby2(df$group, df$outcome, print = FALSE)
+      
+      tibble(
+        pct.diff = (res$measure[3, 1])*100,
+        diff.conf.low  = (res$measure[3, 2])*100,
+        diff.conf.high = (res$measure[3, 3])*100,
+        odds.ratio = res$measure[2,1],
+        OR.conf.low = res$measure[2,2],
+        OR.conf.high = res$measure[2,3],
+      )
+    })
+  ) |>
+  unnest(summary)
+
+(summary_df_cat <- summary_df_cat |> flextable() |> 
+  colformat_double(j = c("pct.diff", "diff.conf.low", "diff.conf.high"), 
+                   digits = 1) |>
+  colformat_double(j = c("odds.ratio", "OR.conf.low", "OR.conf.high"), 
+                   digits = 2) |> 
+  autofit())
+```
+
+Export to Word (commented out for rendering)
+
+```{r export-diff_pct}
+#| warning: false
+summary_df_cat |> save_as_docx(path = "outcome_diff_in_pct.docx")
+```
+
+## Mortality Multivariable Model
+
+Fit a generalized linear mixed-effects model (GLMM) to assess the association of refractory septic shock (`pt_rss`) with hospital mortality (`mort_hosp`). Incorporate random effect (varying intercept) for the shock onset hospital location (`shock_onset_hospital`) and fixed effects for age, sex, Elixhauser Comorbidity Index (`elixhauser_index`), and SOFA-1 at shock onset (`shock_onset_tot_sofa`). Of note, this approach allows baseline mortality risk to vary by hospital location, while assuming the effect of refractory septic shock (`pt_rss`) on hospital mortality (`mort_hosp`) is the same across hospital locations.
+
+Will center and scale the continuous predictors prior to modeling. This approach will improve numerical stability (allowing the model to converge) without changing model fit or inference, particularly because these predictors are treated as confounders for the effect of `pt_rss` in the model. Interpretation will be solely for the effect of `pt_rss`.
+
+```{r}
+incl_scaled <- incl |>
+  mutate(
+    age_z = scale(age),
+    elix_z = scale(elixhauser_index),
+    sofa_z = scale(shock_onset_tot_sofa)
+  )
+
+mod1 <- glmer(mort_hosp == "Died" ~ pt_rss + age_z + sex + elix_z + 
+              sofa_z + (1 | shock_onset_hospital),
+              family = binomial(link = "logit"), data = incl_scaled)
+```
+
+Show model coefficients (exponentiated to convert estimates to odds ratio)
+
+```{r}
+tidy(mod1, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)",
+         effect != "ran_pars") |>
+  select("Term" = term, "Odds Ratio" = estimate, 
+         "95% CI, Low" = conf.low, "95% CI, High" = conf.high) |>
+  kable(align = c('lccc'),
+        digits = 2,
+        caption = "Generalized Linear Mixed-Effects Model for Hospital Mortality"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+In this model the occurrence of refractory septic shock per clinical criteria was associated with 4.71-fold higher odds (95% CI: 4.31, 5.13) of hospital mortality. Only the odds ratio for the exposure variable (refractory septic shock) will be reported in the manuscript, but it is encouraging to see that the directionality of the estimates for the confounders are consistent with expectations.
+
+## Sensitivity Analyses
+
+1a) Shape data for the sensitivity analysis where NEE was calculated per the Goradia equation (`pt_rss_sens_goradia`).
+
+```{r}
+outcomes_epi_sens_goradia <- incl |>
+  mutate(pt_rss_sens_goradia = fct_relevel(pt_rss_sens_goradia, "RSS Present"),
+         mort_hosp = fct_relevel(factor(mort_hosp), "Died")
+         )
+```
+
+1b) Compare (unadjusted) mortality in the sensitivity analysis where NEE was calculated per the Goradia equation.
+
+```{r}
+twoby2(outcomes_epi_sens_goradia$pt_rss_sens_goradia, 
+       outcomes_epi_sens_goradia$mort_hosp
+       )
+```
+
+2a) Shape data for the sensitivity analysis where a lactate concentration threshold >4 mmol/L was utilized (`pt_rss_sens_lactate4`).
+
+```{r}
+outcomes_epi_sens_lactate4 <- incl |>
+  mutate(pt_rss_sens_lactate4 = fct_relevel(pt_rss_sens_lactate4, "RSS Present"),
+         mort_hosp = fct_relevel(factor(mort_hosp), "Died")
+         )
+```
+
+2b) Compare (unadjusted) mortality in the sensitivity analysis where NEE was calculated per the Goradia equation.
+
+```{r}
+twoby2(outcomes_epi_sens_lactate4$pt_rss_sens_lactate4, 
+       outcomes_epi_sens_lactate4$mort_hosp
+       )
+```
+
+3a) Shape data for the sensitivity analysis where a minimum vasopressor duration of 1 hour was utilized (`pt_rss_sens_dur1h`).
+
+```{r}
+outcomes_epi_sens_dur1h <- incl |>
+  mutate(pt_rss_sens_dur1h = fct_relevel(pt_rss_sens_dur1h, "RSS Present"),
+         mort_hosp = fct_relevel(factor(mort_hosp), "Died")
+         )
+```
+
+3b) Compare (unadjusted) mortality in the sensitivity analysis where a minimum vasopressor duration of 1 hour was utilized.
+
+```{r}
+twoby2(outcomes_epi_sens_dur1h$pt_rss_sens_dur1h, 
+       outcomes_epi_sens_dur1h$mort_hosp
+       )
+```
+
+# Snapshot and Session Info
+
+Call `snapshot()` to update the lockfile with metadata about the currently-used packages in the project library (commented out for rendering). Then producing a summary report of the session information.
+
+```{r snapshot-session_info}
+#snapshot()
+summary(report(sessionInfo()))
+```
+
+# Package References
+
+```{r references}
+cite_packages()
+```
