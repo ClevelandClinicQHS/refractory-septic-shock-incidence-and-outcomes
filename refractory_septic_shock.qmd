@@ -1264,7 +1264,6 @@ Describe the characteristics of included patients by cohort (presence or not of 
                  mv_any = "Encounter Mechanical Ventilation"
                  )
     ) |>
-   add_p(pvalue_fun = label_style_pvalue(digits = 2)) |>
    modify_table_body(
     ~ .x |>
         mutate(across(starts_with("stat_"), ~ gsub("%", "", as.character(.x))))
