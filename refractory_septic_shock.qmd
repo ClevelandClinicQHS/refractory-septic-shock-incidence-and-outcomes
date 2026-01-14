@@ -55,6 +55,7 @@ Read in the data from .Rds files created in previous work. Each source .Rds file
 | hosp_char | Hospital_characteristics.csv | none (raw file) |
 | body_weight | weight | weight |
 | comor | comorbidities | comorbidities |
+| sofa | sofa_daily | sofa_daily |
 | lactate | lactate_all | lactate |
 | steroids | steroids | steroids |
 
@@ -107,6 +108,10 @@ body_weight <-
 
 comor <- 
   read_rds("/proj/DaltonLab/projects/sbauer/rds_files/comorbidities.Rds") |>
+  filter(encounter_id %in% shock_orig$encounter_id)
+
+sofa <- 
+  read_rds("/proj/DaltonLab/projects/sbauer/rds_files/sofa_daily.Rds") |>
   filter(encounter_id %in% shock_orig$encounter_id)
 
 lactate <- read_rds(
@@ -736,42 +741,22 @@ shock <- shock |>
             )
 ```
 
-#### Guideline Treatment Era {#sec-ssc-era}
+#### SOFA-1
 
-Septic shock treatment is guided by the Surviving Sepsis Campaign International Guidelines. Four iterations of guidelines were published during the study time period (2012-2024), each with different recommendations for treatment of shock, including the use of adjunctive vasopressors. The common names of the guidelines, publication month/year, and recommendations/suggestions related to adjunctive vasopressor use (with their grading) are outlined below.
-
--   [2008 (published 04 December 2007)](https://link.springer.com/article/10.1007/s00134-007-0934-2): *Vasopressin 0.03 units/min may be subsequently added to norepinephrine with anticipation of an effect equivalent to norepinephrine alone. Use epinephrine as the first alternative agent in septic shock when blood pressure is poorly responsive to norepinephrine or dopamine (2B).*
--   [2012 (published 30 January 2013)](https://link.springer.com/article/10.1007/s00134-012-2769-8): *Epinephrine (added to and potentially substituted for norepinephrine) when an additional agent is needed to maintain adequate blood pressure (grade 2B). Vasopressin 0.03 units/minute can be added to norepinephrine (NE) with intent of either raising MAP or decreasing NE dosage (UG).*
--   [2016 (published 18 January 2017)](https://link.springer.com/article/10.1007/s00134-017-4683-6): *We suggest adding either vasopressin (up to 0.03 U/min) (weak recommendation, moderate quality of evidence) or epinephrine (weak recommendation, low quality of evidence) to norepinephrine with the intent of raising MAP to target, or adding vasopressin (up to 0.03 U/min) (weak recommendation, moderate quality of evidence) to decrease norepinephrine dosage.*
--   [2021 (published 02 October, 2021)](https://link.springer.com/article/10.1007/s00134-021-06506-y): *For adults with septic shock on norepinephrine with inadequate mean arterial pressure levels, we suggest adding vasopressin instead of escalating the dose of norepinephrine. (Weak, moderate quality evidence) For adults with septic shock and inadequate mean arterial pressure levels despite norepinephrine and vasopressin, we suggest adding epinephrine. (Weak, moderate quality evidence)*
-
-Create a categorical vector for the Surviving Sepsis Campaign guideline "era" (`ssc_era`) based on the patient admission date and guideline publication date. Then remove the `admission_time` vector because it won't be used moving forward.
+Here, join the Sequential Organ Failure Assessment, original description (SOFA-1) score at shock onset from the `sofa` tibble. Because vasopressor dosage is part of the refractory septic shock criteria, will join the version of this score (`shock_onset_sofa_no_cv`) without the cardiovascular component because it includes vasopressor dosage as a component (which is part of the refractory septic shock criteria). 
 
 ```{r}
-shock <- shock |>
-  mutate(ssc_era = factor(case_when(
-    admission_time > as.Date("2021-10-02") ~ "SSC 2021",
-    admission_time > as.Date("2017-01-18") ~ "SSC 2016",
-    admission_time > as.Date("2013-01-30") ~ "SSC 2012",
-    admission_time > as.Date("2007-12-04") ~ "SSC 2008",
-    .default = "Error"
-  ))
-         ) |>
-  select(-admission_time)
+shock <- 
+  left_join(shock |> mutate(shock_onset_date = 
+                              as.Date(iv_start(pressors_range))),
+            sofa |> select(encounter_id, date, 
+                           shock_onset_sofa_no_cv = tot_sofa_no_cv
+                           ),
+            join_by(encounter_id, shock_onset_date == date),
+            relationship = "one-to-one"
+            )
 ```
 
-Tabulate `ssc_era` to ensure no "Error" appears and counts match expectations.
-
-```{r}
-shock |> tabyl(ssc_era) |>
-  adorn_pct_formatting() |> 
-  adorn_totals() |> 
-  rename("Surviving Sepsis Campaign Guideline Era" = "ssc_era") |>
-  kable(align = c('lcc')) |>
-  kable_paper(full_width = FALSE)
-```
-
-No "Error" appears and the counts match expectations.
 
 ### Refractory Septic Shock {#sec-rss}
 
@@ -1183,7 +1168,7 @@ Describe the characteristics in the overall study population..
   select(age, sex, race_eth, cerebrovascular_disease, hypertension, 
          heart_failure, chronic_pulmonary_disease, liver_disease,
          kidney_disease, malignancy, diabetes, alcohol_abuse,
-         elixhauser_index, admit_year, ssc_era, shock_onset_hosp_state,  
+         elixhauser_index, admit_year, shock_onset_hosp_state,  
          shock_onset_hosp_beds_cat, shock_onset_hosp_teaching_status,  
          shock_onset_tot_sofa, shock_map_closest,
          shock_lactate_closest, first_pressor, wt_kg, 
@@ -1203,7 +1188,6 @@ Describe the characteristics in the overall study population..
                  sex = "Sex",
                  race_eth = "Race/Ethnicity",
                  elixhauser_index = "Elixhauser Comorbidity Index",
-                 ssc_era = "Surviving Sepsis Campaign Guideline Era",
                  wt_kg = "Weight (kg)",
                  shock_onset_hosp_state = "Hospital State",
                  shock_onset_hosp_beds_cat = "Hospital Beds",
@@ -1241,7 +1225,7 @@ Describe the characteristics of included patients by cohort (presence or not of 
   select(pt_rss, age, sex, race_eth, cerebrovascular_disease, hypertension, 
          heart_failure, chronic_pulmonary_disease, liver_disease,
          kidney_disease, malignancy, diabetes, alcohol_abuse,
-         elixhauser_index, admit_year, ssc_era, shock_onset_hosp_state,  
+         elixhauser_index, admit_year, shock_onset_hosp_state,  
          shock_onset_hosp_beds_cat, shock_onset_hosp_teaching_status,  
          shock_onset_tot_sofa, shock_map_closest,
          shock_lactate_closest, first_pressor, wt_kg, 
@@ -1263,7 +1247,6 @@ Describe the characteristics of included patients by cohort (presence or not of 
                  sex = "Sex",
                  race_eth = "Race/Ethnicity",
                  elixhauser_index = "Elixhauser Comorbidity Index",
-                 ssc_era = "Surviving Sepsis Campaign Guideline Era",
                  wt_kg = "Weight (kg)",
                  shock_onset_hosp_state = "Hospital State",
                  shock_onset_hosp_beds_cat = "Hospital Beds",
@@ -1413,7 +1396,7 @@ summary_df_cat |> save_as_docx(path = "outcome_diff_in_pct.docx")
 
 ## Mortality Multivariable Model
 
-Fit a generalized linear mixed-effects model (GLMM) to assess the association of refractory septic shock (`pt_rss`) with hospital mortality (`mort_hosp`). Incorporate random effect (varying intercept) for the shock onset hospital location (`shock_onset_hospital`) and fixed effects for age, sex, Elixhauser Comorbidity Index (`elixhauser_index`), and SOFA-1 at shock onset (`shock_onset_tot_sofa`). Of note, this approach allows baseline mortality risk to vary by hospital location, while assuming the effect of refractory septic shock (`pt_rss`) on hospital mortality (`mort_hosp`) is the same across hospital locations.
+Fit a generalized linear mixed-effects model (GLMM) to assess the association of refractory septic shock (`pt_rss`) with hospital mortality (`mort_hosp`). Incorporate random effect (varying intercept) for the shock onset hospital location (`shock_onset_hospital`) and fixed effects for age, sex, Elixhauser Comorbidity Index (`elixhauser_index`), and SOFA-1 without the cardiovascular component at shock onset (`shock_onset_sofa_no_cv`). Of note, this approach allows baseline mortality risk to vary by hospital location, while assuming the effect of refractory septic shock (`pt_rss`) on hospital mortality (`mort_hosp`) is the same across hospital locations.
 
 Will center and scale the continuous predictors prior to modeling. This approach will improve numerical stability (allowing the model to converge) without changing model fit or inference, particularly because these predictors are treated as confounders for the effect of `pt_rss` in the model. Interpretation will be solely for the effect of `pt_rss`.
 
@@ -1422,7 +1405,7 @@ incl_scaled <- incl |>
   mutate(
     age_z = scale(age),
     elix_z = scale(elixhauser_index),
-    sofa_z = scale(shock_onset_tot_sofa)
+    sofa_z = scale(shock_onset_sofa_no_cv)
   )
 
 mod1 <- glmer(mort_hosp == "Died" ~ pt_rss + age_z + sex + elix_z + 
@@ -1445,7 +1428,7 @@ tidy(mod1, exponentiate = TRUE, conf.int = TRUE) |>
   kable_paper(full_width = FALSE)
 ```
 
-In this model the occurrence of refractory septic shock per clinical criteria was associated with 4.71-fold higher odds (95% CI: 4.31, 5.13) of hospital mortality. Only the odds ratio for the exposure variable (refractory septic shock) will be reported in the manuscript, but it is encouraging to see that the directionality of the estimates for the confounders are consistent with expectations.
+In this model the occurrence of refractory septic shock per clinical criteria was associated with 4.87-fold higher odds (95% CI: 4.46, 5.31) of hospital mortality. Only the odds ratio for the exposure variable (refractory septic shock) will be reported in the manuscript, but it is encouraging to see that the directionality of the estimates for the confounders are consistent with expectations.
 
 ## Sensitivity Analyses
 
