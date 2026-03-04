@@ -28,11 +28,12 @@ Refractory septic shock was recently defined and clinical criteria established p
 knitr::opts_chunk$set(comment = NA)
 options(width = 70)
 
-library(broom.mixed); library(conflicted); library(Epi); library(flextable);   
-library(gtsummary); library(ivs); library(janitor); library(kableExtra); 
-library(lme4); library(MKinfer); #For `boot.t.test` function
+library(broom.mixed); library(conflicted); library(Epi);   
+library(flextable); library(gtsummary); library(ivs); 
+library(janitor); library(kableExtra); library(lme4); 
+library(MKinfer); #For `boot.t.test` function
 library(naniar); library(patchwork); library(report); library(renv); 
-library(vroom); library(tidyverse)
+library(scales); library(vroom); library(tidyverse)
 
 theme_set(theme_bw())
 
@@ -179,19 +180,19 @@ shock <- shock_orig |>
   rename(admission_time = key_admission_time,
          sepsis_onset_tot_sofa = either_tot_sofa,
          sepsis_onset_unit_type = either_onset_unit_type,
-         encounter_max_sofa = max_sofa
-         ) |>
+         encounter_max_sofa = max_sofa,
+         sepsis_3 = shock_sepsis3) |>
   select(-contains(c("ase", "sep3", "sepsis3", "combined")),
          -c(patient_id, encounter_id_orig, key_discharge_time, first_sepsis,  
             race, ethnicity, admit_year_cat, sepsis_either, sepsis_any,   
             shock_either, shock_exclusive, sepsis_clin_v_code,   
             shock_clin_v_code, either_dx_hosp_beds_cat, either_dx_hosp_state, 
-            either_dx_hosp_teaching_status, covid_positive_through_dc,    
-            either_shock_map_min, either_shock_pressor,      
-            either_shock_lactate_max, either_prior_surg_service, 
-            surgery_30d_prior_to_dc, surg_service_30d_prior_to_dc, dc_hospital,
-            dc_hosp_state, dc_hosp_beds_cat, dc_hosp_teaching_status, 
-            any_icu_admit, bcx_collected, either_abx_days
+            either_dx_hosp_teaching_status, either_shock_map_min, 
+            either_shock_pressor, either_shock_lactate_max, 
+            either_prior_surg_service, surgery_30d_prior_to_dc, 
+            surg_service_30d_prior_to_dc, dc_hospital, dc_hosp_state, 
+            dc_hosp_beds_cat, dc_hosp_teaching_status, any_icu_admit, 
+            bcx_collected, either_abx_days
             )
          ) |>
   rename_with(~ str_replace_all(.x, c("^either_" = "", 
@@ -967,7 +968,7 @@ shock <- shock |>
             relationship = "one-to-one"
             )
 
-rm(max_nee, max_lactate, pressors_doses, lactate)
+#rm(max_nee, max_lactate, pressors_doses, lactate)
 ```
 
 #### Corticosteroids
@@ -1093,17 +1094,30 @@ Included patients were treated in 18 distinct locations in Ohio and 5 distinct l
 
 # Incidence of Refractory Septic Shock
 
-Calculate the co-primary outcome of the incidence of refractory septic shock (`pt_rss`) in patients with septic shock.
+Calculate the cumulative incidence (cases per 1,000 observations) of refractory septic shock ("RSS", `pt_rss`) in patients with septic shock.
 
 ```{r}
-incl |> tabyl(pt_rss) |>
-  adorn_pct_formatting() |> adorn_totals() |>
-  rename("Refractory Septic Shock (RSS)" = pt_rss) |>
-  kable(align = c('lcc'),
-        caption = "Incidence of Refractory Septic Shock"
+incl |> 
+  select(encounter_id, pt_rss) |>
+  summarise(total_cases = n(),
+            rss_cases = sum(pt_rss == "RSS Present")) |> 
+  rowwise() |>
+  mutate(
+    rss_ci = list(prop.test(rss_cases, total_cases, correct = FALSE))
+    ) |>
+  ungroup() |>
+  mutate(
+    rss_est = round_half_up(map_dbl(rss_ci, ~ .x$estimate),3)*1000,
+    lwr_95CI = round_half_up(map_dbl(rss_ci, ~ .x$conf.int[1]),3)*1000,
+    upr_95CI = round_half_up(map_dbl(rss_ci, ~ .x$conf.int[2]),3)*1000
+    ) |>
+  select(-rss_ci) |>
+  kable(align = c('ccccc'),
+        caption = "Cumulative Incidence of Refractory Septic Shock (95% CI)"
         ) |>
   kable_paper(full_width = FALSE)
 ```
+
 
 ## Sensitivity Analyses
 
@@ -1174,7 +1188,8 @@ Describe the characteristics in the overall study population..
          shock_lactate_closest, first_pressor, wt_kg, 
          mv_before_shock, shock_onset_tx_unit, 
          encounter_max_nee, any_adj, encounter_max_lactate,
-         steroid_during_pressors, encounter_max_sofa, mv_any
+         steroid_during_pressors, encounter_max_sofa, mv_any,
+         covid_positive_through_dc
          ) |>
   mutate(shock_onset_hosp_beds_cat = 
            fct_relevel(shock_onset_hosp_beds_cat, "<200", "200-499"),
@@ -1202,7 +1217,8 @@ Describe the characteristics in the overall study population..
                  encounter_max_lactate = "Encounter Maximum Lactate",
                  steroid_during_pressors = "Corticosteroid Administration",
                  encounter_max_sofa = "Encounter Maximum SOFA-1",
-                 mv_any = "Encounter Mechanical Ventilation"
+                 mv_any = "Encounter Mechanical Ventilation",
+                 covid_positive_through_dc = "SARS-CoV-2 PCR positive"
                  )
     ) |>
   modify_table_body(
@@ -1231,7 +1247,8 @@ Describe the characteristics of included patients by cohort (presence or not of 
          shock_lactate_closest, first_pressor, wt_kg, 
          mv_before_shock, shock_onset_tx_unit, 
          encounter_max_nee, any_adj, encounter_max_lactate,
-         steroid_during_pressors, encounter_max_sofa, mv_any
+         steroid_during_pressors, encounter_max_sofa, mv_any,
+         covid_positive_through_dc
          ) |>
   mutate(pt_rss = fct_relevel(pt_rss, "RSS Present"),
          shock_onset_hosp_beds_cat = 
@@ -1261,7 +1278,8 @@ Describe the characteristics of included patients by cohort (presence or not of 
                  encounter_max_lactate = "Encounter Maximum Lactate",
                  steroid_during_pressors = "Corticosteroid Administration",
                  encounter_max_sofa = "Encounter Maximum SOFA-1",
-                 mv_any = "Encounter Mechanical Ventilation"
+                 mv_any = "Encounter Mechanical Ventilation",
+                 covid_positive_through_dc = "SARS-CoV-2 PCR positive"
                  )
     ) |>
    modify_table_body(
@@ -1431,7 +1449,9 @@ In this model the occurrence of refractory septic shock per clinical criteria wa
 
 ## Sensitivity Analyses
 
-1a) Shape data for the sensitivity analysis where NEE was calculated per the Goradia equation (`pt_rss_sens_goradia`).
+### NEE per Goradia
+
+Shape data for the sensitivity analysis where NEE was calculated per the Goradia equation (`pt_rss_sens_goradia`).
 
 ```{r}
 outcomes_epi_sens_goradia <- incl |>
@@ -1440,7 +1460,7 @@ outcomes_epi_sens_goradia <- incl |>
          )
 ```
 
-1b) Compare (unadjusted) mortality in the sensitivity analysis where NEE was calculated per the Goradia equation.
+Compare (unadjusted) mortality in the sensitivity analysis where NEE was calculated per the Goradia equation.
 
 ```{r}
 twoby2(outcomes_epi_sens_goradia$pt_rss_sens_goradia, 
@@ -1448,7 +1468,9 @@ twoby2(outcomes_epi_sens_goradia$pt_rss_sens_goradia,
        )
 ```
 
-2a) Shape data for the sensitivity analysis where a lactate concentration threshold >4 mmol/L was utilized (`pt_rss_sens_lactate4`).
+### Lactate >4
+
+Shape data for the sensitivity analysis where a lactate concentration threshold >4 mmol/L was utilized (`pt_rss_sens_lactate4`).
 
 ```{r}
 outcomes_epi_sens_lactate4 <- incl |>
@@ -1457,7 +1479,7 @@ outcomes_epi_sens_lactate4 <- incl |>
          )
 ```
 
-2b) Compare (unadjusted) mortality in the sensitivity analysis where NEE was calculated per the Goradia equation.
+Compare (unadjusted) mortality in the sensitivity analysis where NEE was calculated per the Goradia equation.
 
 ```{r}
 twoby2(outcomes_epi_sens_lactate4$pt_rss_sens_lactate4, 
@@ -1465,7 +1487,9 @@ twoby2(outcomes_epi_sens_lactate4$pt_rss_sens_lactate4,
        )
 ```
 
-3a) Shape data for the sensitivity analysis where a minimum vasopressor duration of 1 hour was utilized (`pt_rss_sens_dur1h`).
+### Minimum Duration of 1 Hour
+
+Shape data for the sensitivity analysis where a minimum vasopressor duration of 1 hour was utilized (`pt_rss_sens_dur1h`).
 
 ```{r}
 outcomes_epi_sens_dur1h <- incl |>
@@ -1474,12 +1498,365 @@ outcomes_epi_sens_dur1h <- incl |>
          )
 ```
 
-3b) Compare (unadjusted) mortality in the sensitivity analysis where a minimum vasopressor duration of 1 hour was utilized.
+Compare (unadjusted) mortality in the sensitivity analysis where a minimum vasopressor duration of 1 hour was utilized.
 
 ```{r}
 twoby2(outcomes_epi_sens_dur1h$pt_rss_sens_dur1h, 
        outcomes_epi_sens_dur1h$mort_hosp
        )
+```
+
+### Sepsis-3 Criteria
+
+Assess refractory septic shock incidence and mortality in patients meeting Sepsis-3 septic shock criteria (with or without CDC ASE criteria.)
+
+Adjudicate and tabulate eligibility criteria.
+
+```{r}
+shock <- shock |> 
+  mutate(elig_sep3 = case_when(
+    age <18 ~ "exclude-1_age_<18",
+    sepsis_3 != "Sep3" ~ "exclude-2_sepsis-3_criteria_not_met",
+    is.na(encounter_max_nee) ~ "exclude-3_nee_missing",
+    is.na(dc_dispo_f) ~ "exclude-4_discharge_dispo_missing",
+    .default = "include"
+  ))
+
+shock |> 
+  distinct(encounter_id, .keep_all = TRUE) |>
+  tabyl(elig_sep3) |> adorn_totals() |> adorn_pct_formatting() |>
+  rename("Sepsis-3 Sensitivity Analysis Eligibility Criteria" = elig_sep3) |>
+  kable(align = c('lcc'),
+        caption = "Eligibility Adjudication"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+Apply eligibility criteria to create analytic tibble for Sepsis-3 sensitivity analysis (`incl_sep3`), remove vectors that were used to assess eligibility (since they will be uniform), and drop unused levels of categorical variables.
+
+```{r}
+incl_sep3 <- shock |>
+  filter(elig_sep3 == "include") |>
+  droplevels()
+```
+
+Assess incidence of refractory septic shock in Sepsis-3 sensitivity analysis cohort.
+
+```{r}
+incl_sep3 |> tabyl(pt_rss) |>
+  adorn_pct_formatting() |> adorn_totals() |>
+  rename("Refractory Septic Shock (RSS)" = pt_rss) |>
+  kable(align = c('lcc'),
+        caption = "Incidence of Refractory Septic Shock in Sepsis-3 Sensitivity Analysis"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+Describe hospital mortality by refractory septic in Sepsis-3 sensitivity analysis cohort.
+
+```{r}
+incl_sep3 |>
+  select(pt_rss, mort_hosp) |>
+  mutate(pt_rss = fct_relevel(pt_rss, "RSS Present")) |>
+  tbl_summary(
+    by = pt_rss,
+    digits = all_categorical() ~ c(0, 1),
+    label = list(mort_hosp = "Hospital Mortality")
+    ) |>
+  modify_table_body(
+    ~ .x |>
+        mutate(across(starts_with("stat_"), ~ gsub("%", "", as.character(.x))))
+    )
+```
+
+# Post-hoc Analyses Requested
+
+Distribution of body weight
+
+```{r wt-dist-all}
+#| warning: false
+
+p1 <- ggplot(incl, aes(sample = wt_kg)) +
+  geom_qq(col = "navy") + geom_qq_line(col = "red") + 
+  theme(aspect.ratio = 1) + 
+  labs(title = "Normal Q-Q Plot",
+       y = "Weight (kg)",
+       x = "Theoretical Quantiles")
+
+p2 <- ggplot(incl, aes(x = wt_kg)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 30, fill = "navy", col = "white") +
+  labs(title = "Histogram",
+       y = "Density",
+       x = "Weight (kg)")
+
+p3 <- ggplot(incl, aes(x = wt_kg, y = "")) +
+  geom_boxplot(notch = TRUE, fill = "red", outlier.color = "red") +
+  stat_summary(fun = "mean", geom = "point", shape = 23, 
+               size = 2, fill = "white") +
+  labs(title = "Boxplot", 
+       y = "", 
+       x = "Weight (kg)",
+       caption = "Diamond indicates sample mean")
+
+p1 + (p2 / p3 + plot_layout(heights = c(4,1))) +
+  plot_annotation(title = "Distribution of Weight (kg)")
+```
+
+Determine occurrence of NEE >0.5 mcg/kg/min. Use data to assess patients without refractory septic shock having a) any occurrence of NEE >0.5 mcg/kg/min, or b) lactate ≤2 mmol/L when each NEE dosage exceeding 0.5 mcg/kg/min was documented.
+
+```{r}
+pressors_doses |>
+  filter(encounter_id %in% incl$encounter_id) |>
+  group_by(encounter_id) |>
+  mutate(any_nee_0.5 = if_else(any(running_nee_kotani >0.5), "Yes", "No")) |>
+  ungroup() |>
+  select(encounter_id, any_nee_0.5, pt_rss) |>
+  distinct() |>
+  tabyl(any_nee_0.5, pt_rss) |> 
+  rename("Any NEE >0.5" = any_nee_0.5) |>
+  adorn_totals() |>
+  kable(align = c('ccc'),
+        caption = "Patients With Any Occurrence of NEE >0.5 mcg/kg/min by RSS Presence"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+## Outcomes Over Time
+
+Calculate and plot refractory septic shock incidence by year. 
+
+```{r}
+yearly_out <- incl |> 
+  mutate(admit_year = factor(admit_year)) |>
+  select(encounter_id, admit_year, pt_rss, mort_hosp) |>
+  group_by(admit_year) |>
+  summarise(total_cases = n(),
+            rss_cases = sum(pt_rss == "RSS Present"),
+            no_rss_cases = sum(pt_rss == "No RSS"),
+            rss_mort = sum(pt_rss == "RSS Present" & mort_hosp == "Died"),
+            no_rss_mort = sum(pt_rss == "No RSS" & mort_hosp == "Died")) |> 
+  ungroup() |>
+  rowwise() |>
+  mutate(
+    rss_ci = list(prop.test(rss_cases, total_cases, correct = FALSE)),
+    mort_rss_ci = list(prop.test(rss_mort, rss_cases, correct = FALSE)),
+    mort_no_rss_ci = list(prop.test(no_rss_mort, no_rss_cases, correct = FALSE))
+  ) |>
+  ungroup() |>
+  mutate(
+    rss_est = round_half_up(map_dbl(rss_ci, ~ as.numeric(.x$estimate)),3)*1000,
+    rss_lwr = round_half_up(map_dbl(rss_ci, ~ .x$conf.int[1]),3)*1000,
+    rss_upr = round_half_up(map_dbl(rss_ci, ~ .x$conf.int[2]),3)*1000,
+    mort_rss_est = map_dbl(mort_rss_ci, ~ as.numeric(.x$estimate)),
+    mort_rss_lwr = map_dbl(mort_rss_ci, ~ .x$conf.int[1]),
+    mort_rss_upr = map_dbl(mort_rss_ci, ~ .x$conf.int[2]),
+    mort_no_rss_est = map_dbl(mort_no_rss_ci, ~ as.numeric(.x$estimate)),
+    mort_no_rss_lwr = map_dbl(mort_no_rss_ci, ~ .x$conf.int[1]),
+    mort_no_rss_upr = map_dbl(mort_no_rss_ci, ~ .x$conf.int[2])
+  ) |>
+  select(-rss_ci, -mort_rss_ci, -mort_no_rss_ci)
+
+yearly_incidence <- yearly_out |>
+  transmute(
+    admit_year = as.integer(as.character(admit_year)),
+    est = rss_est, lwr = rss_lwr, upr = rss_upr
+    )
+
+ggplot(yearly_incidence, aes(x = admit_year, y = est)) +
+  scale_y_continuous() +
+  scale_x_continuous(breaks = seq(2012, 2024, 1)) +
+  #Horizontal dashed line at the overall (total) estimate
+  geom_hline(yintercept = 218, color = "dodgerblue4", linewidth = 0.3, 
+             linetype = "dashed") +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.2, color = "dodgerblue4") +
+  geom_point(size = 3, color = "dodgerblue4") +
+  labs(x = "Admission Year",
+       y = "Refractory Septic Shock\n(cases per 1,000 patients)") +
+  theme(axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank()
+        )
+
+ggsave("incidence_trend.tiff", device = "tiff", width=9, height=4, 
+       units = "in", dpi=300)
+```
+
+Calculate refractory septic shock mortality by year and absolute risk difference estimate (and 95% CI) by year. 
+
+```{r}
+yearly_mort <- yearly_out |>
+  transmute(
+    admit_year = as.integer(as.character(admit_year)),
+    mort_rss_est, mort_rss_lwr, mort_rss_upr,
+    mort_no_rss_est, mort_no_rss_lwr, mort_no_rss_upr
+  ) |>
+  pivot_longer(
+    -admit_year,
+    names_to = c("group", "stat"),
+    names_pattern = "mort_(rss|no_rss)_(est|lwr|upr)",
+    values_to = "value"
+  ) |>
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) |>
+  mutate(group = recode(group, rss = "RSS", no_rss = "No RSS"))
+
+format_ci_str <- function(est, lwr, upr, digits = 1) {
+  sprintf(
+    paste0("%.", digits, "f (%.", digits, "f, %.", digits, "f)"),
+    est, lwr, upr
+  )
+}
+
+yearly_mort_diff <- yearly_out |>
+  transmute(
+    admit_year,
+    rss_mort, rss_cases, no_rss_mort, no_rss_cases
+  ) |>
+  rowwise() |>
+  mutate(
+    tst  = list(prop.test(
+      x = c(rss_mort,     no_rss_mort),
+      n = c(rss_cases,    no_rss_cases),
+      conf.level = 0.95,
+      correct = FALSE
+    )),
+    p1   = unname(tst$estimate[1]),        
+    p2   = unname(tst$estimate[2]),        
+    diff_est = p1 - p2,                    
+    diff_lwr = tst$conf.int[1],
+    diff_upr = tst$conf.int[2]
+  ) |>
+  ungroup() |>
+  select(admit_year, p1, p2, diff_est, diff_lwr, diff_upr) |>
+  mutate(across(starts_with("diff_"), ~ .x * 100)) |>
+  mutate(diff_str = format_ci_str(diff_est, diff_lwr, diff_upr, digits = 1)) |>
+  mutate(across(c(p1, p2), ~ round_half_up(.x * 100, 1))) |>
+  select("Admit Year" = admit_year, 
+         "RSS Mortality (%)" = p1,
+         "Without RSS Mortality (%)" = p2,
+         "Absolute Risk Difference (95% CI)" = diff_str
+         )
+
+(yearly_mort_diff <- flextable(yearly_mort_diff) |> autofit())
+
+```
+
+Export to Word
+
+```{r}
+yearly_mort_diff |> save_as_docx(path = "yearly_mort_diff.docx")
+```
+
+Now plot mortality by year by group.
+
+```{r}
+ggplot(yearly_mort, aes(x = admit_year, y = est, color = group)) +  
+  #Horizontal dashed lines at the estimates by group
+  geom_hline(yintercept = 0.644, color = "dodgerblue4", linewidth = 0.3, 
+             linetype = "dashed") +
+  geom_hline(yintercept = 0.22, color = "orange4", linewidth = 0.3, 
+             linetype = "dashed") +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.2) +
+  geom_point(size = 3) +
+  geom_line() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(2012, 2024, 1)) +
+  scale_color_manual(values = c("RSS" = "dodgerblue4", "No RSS" = "orange4"), name = NULL) +
+  labs(
+    x = "Admission Year",
+    y = "Hospital Mortality"
+  ) +
+  guides(color = "none") +
+  annotate("text", x = 2021, y = 0.72, label = "Refractory Septic Shock",
+           color = "dodgerblue4", fontface = "bold", size = 4.2, vjust = -0.2) +
+  annotate("text", x = 2021, y = 0.31, label = "Without Refractory Septic Shock",
+           color = "orange4", fontface = "bold", size = 4.2, vjust = -0.2) +
+  theme(axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank()
+        )
+
+ggsave("mortality_trend.tiff", device = "tiff", width=9, height=4, 
+       units = "in", dpi=300)
+```
+
+## Outcomes by Location Size (Bed Count)
+
+```{r}
+beds_out <- incl |> 
+  mutate(beds = 
+           fct_relevel(shock_onset_hosp_beds_cat, "<200", "200-499")) |>
+  select(encounter_id, beds, pt_rss, mort_hosp) |>
+  group_by(beds) |>
+  summarise(total_obs = n(),
+            rss_cases = sum(pt_rss == "RSS Present"),
+            rss_mort = sum(pt_rss == "RSS Present" & mort_hosp == "Died")
+            ) |> 
+  ungroup() |>
+  rowwise() |>
+  mutate(
+    rss_ci = list(prop.test(rss_cases, total_obs, correct = FALSE)),
+    mort_rss_ci = list(prop.test(rss_mort, rss_cases, correct = FALSE))
+  ) |>
+  ungroup() |>
+  mutate(
+    rss_est = round_half_up(map_dbl(rss_ci, ~ as.numeric(.x$estimate)),3)*1000,
+    rss_lwr = round_half_up(map_dbl(rss_ci, ~ .x$conf.int[1]),3)*1000,
+    rss_upr = round_half_up(map_dbl(rss_ci, ~ .x$conf.int[2]),3)*1000,
+    mort_rss_est = map_dbl(mort_rss_ci, ~ as.numeric(.x$estimate)),
+    mort_rss_lwr = map_dbl(mort_rss_ci, ~ .x$conf.int[1]),
+    mort_rss_upr = map_dbl(mort_rss_ci, ~ .x$conf.int[2])
+  ) |>
+  select(-rss_ci, -mort_rss_ci) |>
+  mutate(across(starts_with("mort_"), ~ round_half_up(.x * 100, 1)),
+         rss_incidence = format_ci_str(rss_est, rss_lwr, rss_upr, digits = 0),
+         mort_pct = format_ci_str(mort_rss_est, mort_rss_lwr, mort_rss_upr, digits = 1)
+         ) |>
+  select(beds, total_obs, rss_incidence, mort_pct) |>
+  pivot_longer(
+    cols = -beds,
+    names_to = "metric",
+    values_to = "value",
+    values_transform = list(value = as.character),
+    values_ptypes = list(value = character())
+  ) |>
+  pivot_wider(
+    names_from = beds,
+    values_from = value
+  )
+
+beds_out |>
+  kable(align = c('lccc'),
+        caption = "Outcomes by Hospital Beds"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+Show number of hospitals by beds
+
+```{r}
+incl |>
+  mutate(beds = 
+           fct_relevel(shock_onset_hosp_beds_cat, "<200", "200-499")
+         ) |>
+  summarise(
+  n_settings = n_distinct(shock_onset_hospital),
+  .by = beds
+  ) |>
+  kable(align = c('lccc'),
+        caption = "Hospital Count by Hospital Beds"
+        ) |>
+  kable_paper(full_width = FALSE)
 ```
 
 # Snapshot and Session Info
