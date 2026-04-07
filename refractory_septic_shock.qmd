@@ -184,7 +184,7 @@ shock <- shock_orig |>
          sepsis_3 = shock_sepsis3) |>
   select(-contains(c("ase", "sep3", "sepsis3", "combined")),
          -c(patient_id, encounter_id_orig, key_discharge_time, first_sepsis,  
-            race, ethnicity, admit_year_cat, sepsis_either, sepsis_any,   
+            race, ethnicity, sepsis_either, sepsis_any,   
             shock_either, shock_exclusive, sepsis_clin_v_code,   
             shock_clin_v_code, either_dx_hosp_beds_cat, either_dx_hosp_state, 
             either_dx_hosp_teaching_status, either_shock_map_min, 
@@ -1175,14 +1175,14 @@ mosaic::favstats(~hours_to_rss,
 
 # Patient Characteristics {#sec-char}
 
-Describe the characteristics in the overall study population..
+Describe the characteristics in the overall study population.
 
 ```{r}
 (char_overall <- incl |>
   select(age, sex, race_eth, cerebrovascular_disease, hypertension, 
          heart_failure, chronic_pulmonary_disease, liver_disease,
          kidney_disease, malignancy, diabetes, alcohol_abuse,
-         elixhauser_index, admit_year, shock_onset_hosp_state,  
+         elixhauser_index, admit_year_cat, shock_onset_hosp_state,  
          shock_onset_hosp_beds_cat, shock_onset_hosp_teaching_status,  
          shock_onset_tot_sofa, shock_map_closest,
          shock_lactate_closest, first_pressor, wt_kg, 
@@ -1241,7 +1241,7 @@ Describe the characteristics of included patients by cohort (presence or not of 
   select(pt_rss, age, sex, race_eth, cerebrovascular_disease, hypertension, 
          heart_failure, chronic_pulmonary_disease, liver_disease,
          kidney_disease, malignancy, diabetes, alcohol_abuse,
-         elixhauser_index, admit_year, shock_onset_hosp_state,  
+         elixhauser_index, admit_year_cat, shock_onset_hosp_state,  
          shock_onset_hosp_beds_cat, shock_onset_hosp_teaching_status,  
          shock_onset_tot_sofa, shock_map_closest,
          shock_lactate_closest, first_pressor, wt_kg, 
@@ -1855,6 +1855,44 @@ incl |>
   ) |>
   kable(align = c('lccc'),
         caption = "Hospital Count by Hospital Beds"
+        ) |>
+  kable_paper(full_width = FALSE)
+```
+
+## Outcomes at Large Academic Center
+
+Show outcomes only at the large academic medical center ("Main Campus").
+
+```{r}
+incl |> 
+  filter(shock_onset_hospital == "Main Campus") |>
+  select(encounter_id, pt_rss, mort_hosp) |>
+  summarise(total_obs = n(),
+            rss_cases = sum(pt_rss == "RSS Present"),
+            rss_mort = sum(pt_rss == "RSS Present" & mort_hosp == "Died")
+            ) |> 
+  rowwise() |>
+  mutate(
+    rss_ci = list(prop.test(rss_cases, total_obs, correct = FALSE)),
+    mort_rss_ci = list(prop.test(rss_mort, rss_cases, correct = FALSE))
+  ) |>
+  ungroup() |>
+  mutate(
+    rss_est = round_half_up(map_dbl(rss_ci, ~ as.numeric(.x$estimate)),3)*1000,
+    rss_lwr = round_half_up(map_dbl(rss_ci, ~ .x$conf.int[1]),3)*1000,
+    rss_upr = round_half_up(map_dbl(rss_ci, ~ .x$conf.int[2]),3)*1000,
+    mort_rss_est = map_dbl(mort_rss_ci, ~ as.numeric(.x$estimate)),
+    mort_rss_lwr = map_dbl(mort_rss_ci, ~ .x$conf.int[1]),
+    mort_rss_upr = map_dbl(mort_rss_ci, ~ .x$conf.int[2])
+  ) |>
+  select(-rss_ci, -mort_rss_ci) |>
+  mutate(across(starts_with("mort_"), ~ round_half_up(.x * 100, 1)),
+         rss_incidence = format_ci_str(rss_est, rss_lwr, rss_upr, digits = 0),
+         mort_pct = format_ci_str(mort_rss_est, mort_rss_lwr, mort_rss_upr, digits = 1)
+         ) |>
+  select(total_obs, rss_incidence, mort_pct) |>
+  kable(align = c('lccc'),
+        caption = "Outcomes at Large Academic Center"
         ) |>
   kable_paper(full_width = FALSE)
 ```
